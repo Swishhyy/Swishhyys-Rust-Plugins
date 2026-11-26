@@ -231,11 +231,29 @@ namespace Oxide.Plugins
         /// </summary>
         private void SetRoute(BradleyAPC apc, Vector3 start)
         {
+            var route = BuildRoute(start);
+            if (route.Count < 2)
+            {
+                PrintWarning("Could not build a road route; this Bradley will use the game's default patrol.");
+                return;
+            }
+
+            if (!TryApplyRoute(apc, route))
+            {
+                PrintWarning("Could not find a writable route list on this BradleyAPC. Member dump follows once.");
+                LogBradleyMembers(apc);
+            }
+        }
+
+        private const int RouteLegs = 8;
+
+        // Start point followed by up to RouteLegs random road points, each at least MinLegDistance from the last.
+        private List<Vector3> BuildRoute(Vector3 start)
+        {
             var route = new List<Vector3> { start };
             var current = start;
 
-            // Build a route of 8 legs. Each next point is a random road point far enough away.
-            for (int i = 0; i < 8; i++)
+            for (int i = 0; i < RouteLegs; i++)
             {
                 var candidates = _roadPoints.Where(p => Vector3.Distance(p, current) >= _config.MinLegDistance).ToList();
                 if (candidates.Count == 0) break;
@@ -243,10 +261,58 @@ namespace Oxide.Plugins
                 current = candidates[UnityEngine.Random.Range(0, candidates.Count)];
                 route.Add(current);
             }
+            return route;
+        }
 
-            // Diagnostic step: the BradleyAPC member names used by the route code are not
-            // confirmed. Log the real members once so they can be matched, then apply nothing.
-            LogBradleyMembers(apc);
+        // Writes the route into the first List<Vector3> on the APC (or on a path object it holds)
+        // whose name looks like a route. Returns false if none is found.
+        private bool TryApplyRoute(BradleyAPC apc, List<Vector3> route)
+        {
+            var list = FindRouteList(apc, 2);
+            if (list == null) return false;
+
+            list.Clear();
+            list.AddRange(route);
+            return true;
+        }
+
+        private static List<Vector3> FindRouteList(object owner, int depth)
+        {
+            if (owner == null || depth < 0) return null;
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var type = owner.GetType();
+
+            foreach (var f in type.GetFields(flags))
+            {
+                if (f.FieldType == typeof(List<Vector3>) && IsRouteName(f.Name) && f.GetValue(owner) is List<Vector3> found)
+                    return found;
+            }
+
+            foreach (var p in type.GetProperties(flags))
+            {
+                if (p.PropertyType == typeof(List<Vector3>) && p.CanRead && IsRouteName(p.Name)
+                    && p.GetIndexParameters().Length == 0 && p.GetValue(owner) is List<Vector3> found)
+                    return found;
+            }
+
+            // The route may sit on a nested path object, so look one level deeper.
+            foreach (var f in type.GetFields(flags))
+            {
+                if (f.FieldType.IsClass && f.FieldType != typeof(string) && f.FieldType.Name.ToLowerInvariant().Contains("path"))
+                {
+                    var nested = FindRouteList(f.GetValue(owner), depth - 1);
+                    if (nested != null) return nested;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool IsRouteName(string name)
+        {
+            name = name.ToLowerInvariant();
+            return name.Contains("path") || name.Contains("point") || name.Contains("route") || name.Contains("interest");
         }
 
         private static bool _membersLogged;
