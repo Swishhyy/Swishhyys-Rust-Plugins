@@ -10,7 +10,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Road Bradley", "you", "0.2.0")]
+    [Info("Road Bradley", "you", "0.3.0")]
     [Description("Spawns a Bradley APC that roams the road network, shows on the map, and leaves scientist patrols behind when destroyed.")]
     public class RoadBradley : RustPlugin
     {
@@ -19,6 +19,7 @@ namespace Oxide.Plugins
         private const string GenericMarkerPrefab = "assets/prefabs/tools/map/genericradiusmarker.prefab";
         private const string LabelMarkerPrefab = "assets/prefabs/deployable/vendingmachine/vending_mapmarker.prefab";
         private const float MarkerUpdateSeconds = 2f;
+        private const float RouteCheckSeconds = 3f;
 
         private string _bradleyPrefab = DefaultBradleyPrefab;
         private bool _prefabLearned;
@@ -30,7 +31,14 @@ namespace Oxide.Plugins
         private readonly Dictionary<BradleyAPC, Timer> _despawnTimers = new Dictionary<BradleyAPC, Timer>();
         private readonly Dictionary<BradleyAPC, MapMarker> _markers = new Dictionary<BradleyAPC, MapMarker>();
         private Timer _spawnTimer;
-        private List<Vector3> _roadPoints;
+        private List<List<Vector3>> _roads;   // each road as evenly spaced points, in order
+        private readonly Dictionary<BradleyAPC, BradleyRoute> _routes = new Dictionary<BradleyAPC, BradleyRoute>();
+
+        private sealed class BradleyRoute
+        {
+            public List<Vector3> Loop;      // the road there and back, so the APC never has to leave it
+            public List<Vector3> Written;   // what was last written into the APC's route list
+        }
 
         #region Config
 
@@ -45,8 +53,17 @@ namespace Oxide.Plugins
             [JsonProperty("Despawn after (minutes, 0 = never)")]
             public float DespawnAfterMinutes = 60f;
 
-            [JsonProperty("Minimum distance between road points (m)")]
-            public float MinLegDistance = 200f;
+            [JsonProperty("Minimum road length to drive (m)")]
+            public float MinRoadLength = 400f;
+
+            [JsonProperty("Minimum road width to drive (m, 0 = any; skips narrow trails)")]
+            public float MinRoadWidth = 8f;
+
+            [JsonProperty("Spacing between route points along the road (m)")]
+            public float RouteSpacing = 10f;
+
+            [JsonProperty("Distance off the road before steering back (m)")]
+            public float OffRoadTolerance = 12f;
 
             [JsonProperty("Spawn on first server start")]
             public bool SpawnOnStart = true;
@@ -70,7 +87,10 @@ namespace Oxide.Plugins
             public string MarkerColor = "#8E24AA";
 
             [JsonProperty("Map marker radius")]
-            public float MarkerRadius = 0.25f;
+            public float MarkerRadius = 0.08f;
+
+            [JsonProperty("Show a hover label (shop icon) with the marker")]
+            public bool ShowMarkerLabel = true;
         }
 
         protected override void LoadConfig()
@@ -79,6 +99,10 @@ namespace Oxide.Plugins
             try
             {
                 _config = Config.ReadObject<Configuration>() ?? new Configuration();
+                // 0.2.0 shipped a marker that covered half a grid square.
+                if (Mathf.Approximately(_config.MarkerRadius, 0.25f)) _config.MarkerRadius = 0.08f;
+                _config.RouteSpacing = Mathf.Max(2f, _config.RouteSpacing);
+                _config.OffRoadTolerance = Mathf.Max(3f, _config.OffRoadTolerance);
             }
             catch (Exception ex)
             {
@@ -103,14 +127,14 @@ namespace Oxide.Plugins
 
         private void OnServerInitialized()
         {
-            _roadPoints = BuildRoadPoints();
-            if (_roadPoints.Count < 2)
+            _roads = BuildRoads();
+            if (_roads.Count == 0)
             {
-                PrintError("No road points found on this map. Plugin disabled.");
+                PrintError("No roads long and wide enough were found on this map. Plugin disabled.");
                 return;
             }
 
-            Puts($"Loaded {_roadPoints.Count} road points.");
+            Puts($"Loaded {_roads.Count} drivable road(s).");
 
             var existing = UnityEngine.Object.FindObjectsOfType<BradleyAPC>().FirstOrDefault();
             if (existing != null)
@@ -123,6 +147,7 @@ namespace Oxide.Plugins
 
             _spawnTimer = timer.Every(_config.SpawnIntervalMinutes * 60f, TrySpawn);
             timer.Every(MarkerUpdateSeconds, UpdateMarkers);
+            timer.Every(RouteCheckSeconds, KeepOnRoads);
             if (_config.SpawnOnStart) TrySpawn();
         }
 
@@ -134,6 +159,7 @@ namespace Oxide.Plugins
 
             foreach (var marker in _markers.Values) marker.Destroy();
             _markers.Clear();
+            _routes.Clear();
 
             foreach (var apc in _active.ToList())
             {
@@ -172,6 +198,7 @@ namespace Oxide.Plugins
 
             // The despawn timer drops the APC from _active before killing it, so always clear its marker.
             RemoveMarker(apc);
+            _routes.Remove(apc);
 
             if (!_active.Contains(apc)) return;
 
@@ -219,13 +246,14 @@ namespace Oxide.Plugins
         private bool SpawnOne(out string reason)
         {
             reason = null;
-            if (_roadPoints == null || _roadPoints.Count < 2)
+            if (_roads == null || _roads.Count == 0)
             {
-                reason = "no road points loaded";
+                reason = "no drivable roads loaded";
                 return false;
             }
 
-            var start = _roadPoints[UnityEngine.Random.Range(0, _roadPoints.Count)];
+            List<Vector3> road = _roads[UnityEngine.Random.Range(0, _roads.Count)];
+            var start = road[UnityEngine.Random.Range(0, road.Count)];
             var entity = GameManager.server.CreateEntity(_bradleyPrefab, start + Vector3.up * 0.5f, Quaternion.identity);
             if (entity == null)
             {
@@ -244,11 +272,11 @@ namespace Oxide.Plugins
             }
 
             _active.Add(apc);
-            SetRoute(apc, start);
+            SetRoute(apc, road);
             ScheduleDespawn(apc);
 
             if (_config.ShowOnMap)
-                _markers[apc] = MapMarker.Create(apc.transform.position, _config.MarkerColor, _config.MarkerLabel, _config.MarkerRadius);
+                _markers[apc] = new MapMarker(apc.transform.position, _config.MarkerColor, _config.MarkerLabel, _config.MarkerRadius, _config.ShowMarkerLabel);
             return true;
         }
 
@@ -303,53 +331,63 @@ namespace Oxide.Plugins
             _markers.Remove(apc);
         }
 
-        // A coloured dot plus a hover label, moved as the Bradley moves.
+        // A coloured dot plus an optional hover label. Rust clients don't follow a marker that
+        // moves on the server, so it is respawned at the new spot once it has moved far enough.
         private sealed class MapMarker
         {
+            private const float RespawnDistance = 5f;
+
+            private readonly Color _color;
+            private readonly string _text;
+            private readonly float _radius;
+            private readonly bool _showLabel;
+            private Vector3 _position;
             private MapMarkerGenericRadius _dot;
             private VendingMachineMapMarker _label;
 
-            public static MapMarker Create(Vector3 position, string hexColor, string text, float radius)
+            public MapMarker(Vector3 position, string hexColor, string text, float radius, bool showLabel)
             {
-                var marker = new MapMarker();
-                Color color;
-                if (!ColorUtility.TryParseHtmlString(hexColor, out color))
-                    color = Color.magenta;
-
-                marker._dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
-                if (marker._dot != null)
-                {
-                    marker._dot.EnableSaving(false);
-                    marker._dot.alpha = 0.8f;
-                    marker._dot.color1 = color;
-                    marker._dot.color2 = Color.black;
-                    marker._dot.radius = radius;
-                    marker._dot.Spawn();
-                    marker._dot.SendUpdate();
-                }
-
-                marker._label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
-                if (marker._label != null)
-                {
-                    marker._label.EnableSaving(false);
-                    marker._label.markerShopName = text;
-                    marker._label.Spawn();
-                }
-
-                return marker;
+                if (!ColorUtility.TryParseHtmlString(hexColor, out _color))
+                    _color = Color.magenta;
+                _text = text;
+                _radius = radius;
+                _showLabel = showLabel;
+                Spawn(position);
             }
 
             public void MoveTo(Vector3 position)
             {
-                if (_dot != null && !_dot.IsDestroyed)
+                if (Vector3.Distance(position, _position) < RespawnDistance)
+                    return;
+                Destroy();
+                Spawn(position);
+            }
+
+            private void Spawn(Vector3 position)
+            {
+                _position = position;
+
+                _dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
+                if (_dot != null)
                 {
-                    _dot.transform.position = position;
+                    _dot.EnableSaving(false);
+                    _dot.alpha = 0.9f;
+                    _dot.color1 = _color;
+                    _dot.color2 = Color.black;
+                    _dot.radius = _radius;
+                    _dot.Spawn();
                     _dot.SendUpdate();
                 }
-                if (_label != null && !_label.IsDestroyed)
+
+                if (!_showLabel)
+                    return;
+
+                _label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
+                if (_label != null)
                 {
-                    _label.transform.position = position;
-                    _label.SendNetworkUpdate();
+                    _label.EnableSaving(false);
+                    _label.markerShopName = _text;
+                    _label.Spawn();
                 }
             }
 
@@ -359,8 +397,14 @@ namespace Oxide.Plugins
                     _dot.Kill();
                 if (_label != null && !_label.IsDestroyed)
                     _label.Kill();
+                _dot = null;
+                _label = null;
             }
         }
+
+        #endregion
+
+        #region Despawn
 
         private void ScheduleDespawn(BradleyAPC apc)
         {
@@ -381,56 +425,119 @@ namespace Oxide.Plugins
 
         #region Routing
 
-        /// <summary>
-        /// Builds a looping route of random road points and hands it to the APC's
-        /// path system. The chain starts at `start` and each leg is at least
-        /// MinLegDistance away from the previous point.
-        /// </summary>
-        private void SetRoute(BradleyAPC apc, Vector3 start)
+        // Gives the APC one road's points, in order, there and back on a loop, so it drives along
+        // the road instead of cutting across country between far-apart points.
+        private void SetRoute(BradleyAPC apc, List<Vector3> road)
         {
-            var route = BuildRoute(start);
-            if (route.Count < 2)
+            var state = new BradleyRoute { Loop = BuildLoop(road) };
+            _routes[apc] = state;
+            ApplyRoute(apc, state, NearestIndex(state.Loop, apc.transform.position, out _));
+        }
+
+        // Every few seconds: if the APC strayed off the road, or its own AI replaced the route,
+        // write the route again starting from the nearest road point so it drives straight back.
+        private void KeepOnRoads()
+        {
+            foreach (var pair in _routes.ToList())
             {
-                PrintWarning("Could not build a road route; this Bradley will use the game's default patrol.");
+                BradleyAPC apc = pair.Key;
+                BradleyRoute state = pair.Value;
+                if (apc == null || apc.IsDestroyed)
+                {
+                    _routes.Remove(apc);
+                    continue;
+                }
+
+                float offRoad;
+                int nearest = NearestIndex(state.Loop, apc.transform.position, out offRoad);
+                List<Vector3> list = FindRouteList(apc, 2);
+                bool replaced = list == null || state.Written == null || list.Count != state.Written.Count
+                                || (list.Count > 0 && list[0] != state.Written[0]);
+
+                if (replaced || offRoad > _config.OffRoadTolerance)
+                    ApplyRoute(apc, state, nearest);
+            }
+        }
+
+        private void ApplyRoute(BradleyAPC apc, BradleyRoute state, int startIndex)
+        {
+            var rotated = new List<Vector3>(state.Loop.Count);
+            for (int i = 0; i < state.Loop.Count; i++)
+                rotated.Add(state.Loop[(startIndex + i) % state.Loop.Count]);
+
+            List<Vector3> list = FindRouteList(apc, 2);
+            if (list == null)
+            {
+                if (!_membersLogged)
+                    PrintWarning("Could not find a writable route list on this BradleyAPC, so it can't be kept on roads. Member dump follows.");
+                LogBradleyMembers(apc);
                 return;
             }
 
-            if (!TryApplyRoute(apc, route))
-            {
-                PrintWarning("Could not find a writable route list on this BradleyAPC. Member dump follows once.");
-                LogBradleyMembers(apc);
-            }
-        }
-
-        private const int RouteLegs = 8;
-
-        // Start point followed by up to RouteLegs random road points, each at least MinLegDistance from the last.
-        private List<Vector3> BuildRoute(Vector3 start)
-        {
-            var route = new List<Vector3> { start };
-            var current = start;
-
-            for (int i = 0; i < RouteLegs; i++)
-            {
-                var candidates = _roadPoints.Where(p => Vector3.Distance(p, current) >= _config.MinLegDistance).ToList();
-                if (candidates.Count == 0) break;
-
-                current = candidates[UnityEngine.Random.Range(0, candidates.Count)];
-                route.Add(current);
-            }
-            return route;
-        }
-
-        // Writes the route into the first List<Vector3> on the APC (or on a path object it holds)
-        // whose name looks like a route. Returns false if none is found.
-        private bool TryApplyRoute(BradleyAPC apc, List<Vector3> route)
-        {
-            var list = FindRouteList(apc, 2);
-            if (list == null) return false;
-
             list.Clear();
-            list.AddRange(route);
-            return true;
+            list.AddRange(rotated);
+            state.Written = rotated;
+
+            // Start at the first point and loop at the end, where the APC exposes those settings.
+            SetMember(apc, typeof(int), "pathindex", 0);
+            SetMember(apc, typeof(bool), "loop", true);
+        }
+
+        // The road forward and then back again; a closed road is just driven round.
+        private List<Vector3> BuildLoop(List<Vector3> road)
+        {
+            var loop = new List<Vector3>(road);
+            bool closed = road.Count > 2 && Vector3.Distance(road[0], road[road.Count - 1]) <= _config.RouteSpacing * 2f;
+            if (!closed)
+            {
+                for (int i = road.Count - 2; i >= 1; i--)
+                    loop.Add(road[i]);
+            }
+            return loop;
+        }
+
+        private static int NearestIndex(List<Vector3> points, Vector3 position, out float distance)
+        {
+            int best = 0;
+            distance = float.MaxValue;
+            for (int i = 0; i < points.Count; i++)
+            {
+                Vector3 a = points[i];
+                float dx = a.x - position.x, dz = a.z - position.z;
+                float d = Mathf.Sqrt(dx * dx + dz * dz);
+                if (d < distance)
+                {
+                    distance = d;
+                    best = i;
+                }
+            }
+            return best;
+        }
+
+        private static bool _membersReported;
+
+        // Sets the first instance field of the given type whose name contains `nameHint`.
+        private void SetMember(BradleyAPC apc, Type type, string nameHint, object value)
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            FieldInfo field = apc.GetType().GetFields(flags)
+                .FirstOrDefault(f => f.FieldType == type && f.Name.ToLowerInvariant().Contains(nameHint));
+            if (field == null)
+                return;
+
+            try
+            {
+                field.SetValue(apc, value);
+                if (!_membersReported)
+                    Puts($"Route control: set {apc.GetType().Name}.{field.Name} = {value}");
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Could not set {field.Name}: {ex.Message}");
+            }
+
+            if (nameHint == "loop")
+                _membersReported = true;
         }
 
         private static List<Vector3> FindRouteList(object owner, int depth)
@@ -502,27 +609,42 @@ namespace Oxide.Plugins
             Puts("BradleyAPC properties: " + string.Join(", ", props));
         }
 
-        /// <summary>
-        /// Collects road points from the map's road network.
-        /// ASSUMPTION TO VERIFY: TerrainMeta.Path.Roads is a list of paths whose
-        /// Points array holds the road polyline.
-        /// </summary>
-        private List<Vector3> BuildRoadPoints()
+        // Each road as points every RouteSpacing metres, skipping short roads and (where the game
+        // exposes a width) narrow trails.
+        private List<List<Vector3>> BuildRoads()
         {
-            var points = new List<Vector3>();
+            var roads = new List<List<Vector3>>();
             try
             {
                 foreach (var road in TerrainMeta.Path.Roads)
                 {
-                    if (road?.Path?.Points == null) continue;
-                    points.AddRange(road.Path.Points);
+                    Vector3[] points = road?.Path?.Points;
+                    if (points == null || points.Length < 2) continue;
+
+                    if (_config.MinRoadWidth > 0f && SafeGet(() => road.GetType().GetField("Width")?.GetValue(road)) is float width
+                        && width < _config.MinRoadWidth)
+                        continue;
+
+                    var spaced = new List<Vector3> { points[0] };
+                    float length = 0f;
+                    for (int i = 1; i < points.Length; i++)
+                    {
+                        length += Vector3.Distance(points[i - 1], points[i]);
+                        if (Vector3.Distance(spaced[spaced.Count - 1], points[i]) >= _config.RouteSpacing)
+                            spaced.Add(points[i]);
+                    }
+                    if (spaced[spaced.Count - 1] != points[points.Length - 1])
+                        spaced.Add(points[points.Length - 1]);
+
+                    if (length >= _config.MinRoadLength && spaced.Count >= 2)
+                        roads.Add(spaced);
                 }
             }
             catch (Exception ex)
             {
                 PrintError($"Could not read road network: {ex.Message}");
             }
-            return points;
+            return roads;
         }
 
         #endregion

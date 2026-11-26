@@ -10,7 +10,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("ScientistPatrols", "Swishhyy", "0.2.0")]
+    [Info("ScientistPatrols", "Swishhyy", "0.3.0")]
     [Description("Tiered scientist patrols that roam the roads, show on the map, and raid bases whose owners are online")]
     public class ScientistPatrols : RustPlugin
     {
@@ -19,7 +19,9 @@ namespace Oxide.Plugins
         private const string PermAdmin = "scientistpatrols.admin";
 
         private const string RoamScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_roam.prefab";
-        private const string HeavyScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/heavyscientist/heavyscientist.prefab";
+        private const string HeavyScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/heavyscientist/heavyscientistad.prefab";
+        // Wrong path shipped in 0.2.0; configs saved with it are migrated on load.
+        private const string OldHeavyScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/heavyscientist/heavyscientist.prefab";
         private const string GenericMarkerPrefab = "assets/prefabs/tools/map/genericradiusmarker.prefab";
         private const string LabelMarkerPrefab = "assets/prefabs/deployable/vendingmachine/vending_mapmarker.prefab";
 
@@ -113,7 +115,10 @@ namespace Oxide.Plugins
             public bool ShowOnMap = true;
 
             [JsonProperty("Map marker radius")]
-            public float MarkerRadius = 0.2f;
+            public float MarkerRadius = 0.06f;
+
+            [JsonProperty("Show a hover label (shop icon) with the marker")]
+            public bool ShowMarkerLabel = true;
 
             [JsonProperty("Chance a patrol spawn or raid is announced in chat (%)")]
             public float AnnounceChancePercent = 50f;
@@ -192,9 +197,14 @@ namespace Oxide.Plugins
                 {
                     if (tier == null) continue;
                     tier.SquadSize = Mathf.Clamp(tier.SquadSize, 1, 10);
+                    if (tier.Prefab == OldHeavyScientistPrefab)
+                        tier.Prefab = HeavyScientistPrefab;
                     tier.Wear = tier.Wear ?? new List<string>();
                 }
 
+                // 0.2.0 shipped markers that covered half a grid square.
+                if (Mathf.Approximately(config.MarkerRadius, 0.2f))
+                    config.MarkerRadius = 0.06f;
                 config.MaxPatrols = Mathf.Max(0, config.MaxPatrols);
                 config.SpawnIntervalMinutes = Mathf.Max(1f, config.SpawnIntervalMinutes);
                 config.RaidCheckSeconds = Mathf.Max(5f, config.RaidCheckSeconds);
@@ -224,6 +234,7 @@ namespace Oxide.Plugins
         private void OnServerInitialized()
         {
             blockMask = LayerMask.GetMask("Construction", "Deployed");
+            ResolveTierPrefabs();
             roadPoints = BuildRoadPoints();
             if (roadPoints.Count == 0)
             {
@@ -305,7 +316,7 @@ namespace Oxide.Plugins
 
             patrols.Add(patrol);
             if (config.ShowOnMap)
-                patrol.Marker = MapMarker.Create(patrol.Leader.transform.position, tier.MarkerColor, tier.DisplayName, config.MarkerRadius);
+                patrol.Marker = new MapMarker(patrol.Leader.transform.position, tier.MarkerColor, tier.DisplayName, config.MarkerRadius, config.ShowMarkerLabel);
             PickWaypoint(patrol);
             return true;
         }
@@ -620,53 +631,63 @@ namespace Oxide.Plugins
 
         #region Map markers
 
-        // A coloured dot plus a hover label, moved as the patrol moves.
+        // A coloured dot plus an optional hover label. Rust clients don't follow a marker that
+        // moves on the server, so it is respawned at the new spot once it has moved far enough.
         private sealed class MapMarker
         {
+            private const float RespawnDistance = 5f;
+
+            private readonly Color _color;
+            private readonly string _text;
+            private readonly float _radius;
+            private readonly bool _showLabel;
+            private Vector3 _position;
             private MapMarkerGenericRadius _dot;
             private VendingMachineMapMarker _label;
 
-            public static MapMarker Create(Vector3 position, string hexColor, string text, float radius)
+            public MapMarker(Vector3 position, string hexColor, string text, float radius, bool showLabel)
             {
-                var marker = new MapMarker();
-                Color color;
-                if (!ColorUtility.TryParseHtmlString(hexColor, out color))
-                    color = Color.red;
-
-                marker._dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
-                if (marker._dot != null)
-                {
-                    marker._dot.EnableSaving(false);
-                    marker._dot.alpha = 0.8f;
-                    marker._dot.color1 = color;
-                    marker._dot.color2 = Color.black;
-                    marker._dot.radius = radius;
-                    marker._dot.Spawn();
-                    marker._dot.SendUpdate();
-                }
-
-                marker._label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
-                if (marker._label != null)
-                {
-                    marker._label.EnableSaving(false);
-                    marker._label.markerShopName = text;
-                    marker._label.Spawn();
-                }
-
-                return marker;
+                if (!ColorUtility.TryParseHtmlString(hexColor, out _color))
+                    _color = Color.red;
+                _text = text;
+                _radius = radius;
+                _showLabel = showLabel;
+                Spawn(position);
             }
 
             public void MoveTo(Vector3 position)
             {
-                if (_dot != null && !_dot.IsDestroyed)
+                if (Vector3.Distance(position, _position) < RespawnDistance)
+                    return;
+                Destroy();
+                Spawn(position);
+            }
+
+            private void Spawn(Vector3 position)
+            {
+                _position = position;
+
+                _dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
+                if (_dot != null)
                 {
-                    _dot.transform.position = position;
+                    _dot.EnableSaving(false);
+                    _dot.alpha = 0.9f;
+                    _dot.color1 = _color;
+                    _dot.color2 = Color.black;
+                    _dot.radius = _radius;
+                    _dot.Spawn();
                     _dot.SendUpdate();
                 }
-                if (_label != null && !_label.IsDestroyed)
+
+                if (!_showLabel)
+                    return;
+
+                _label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
+                if (_label != null)
                 {
-                    _label.transform.position = position;
-                    _label.SendNetworkUpdate();
+                    _label.EnableSaving(false);
+                    _label.markerShopName = _text;
+                    _label.Spawn();
                 }
             }
 
@@ -676,6 +697,8 @@ namespace Oxide.Plugins
                     _dot.Kill();
                 if (_label != null && !_label.IsDestroyed)
                     _label.Kill();
+                _dot = null;
+                _label = null;
             }
         }
 
@@ -705,6 +728,44 @@ namespace Oxide.Plugins
                     return pair.Key;
             }
             return config.Tiers.Keys.Last();
+        }
+
+        // If a tier's prefab isn't a real prefab on this build, look for one with the same file name
+        // in the game's prefab list (e.g. "heavyscientist") and use that for this session.
+        private void ResolveTierPrefabs()
+        {
+            ICollection<string> known;
+            try
+            {
+                known = StringPool.toNumber.Keys;
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Couldn't read the game's prefab list, so prefab paths can't be auto-corrected: {ex.Message}");
+                return;
+            }
+
+            foreach (KeyValuePair<string, TierConfig> pair in config.Tiers)
+            {
+                TierConfig tier = pair.Value;
+                if (tier == null || string.IsNullOrEmpty(tier.Prefab) || known.Contains(tier.Prefab))
+                    continue;
+
+                string stem = System.IO.Path.GetFileNameWithoutExtension(tier.Prefab).ToLowerInvariant();
+                string match = known
+                    .Where(k => k.EndsWith(".prefab") && k.Contains("/npcplayer/") && System.IO.Path.GetFileName(k).StartsWith(stem))
+                    .OrderBy(k => k.Length)
+                    .FirstOrDefault();
+
+                if (match == null)
+                {
+                    PrintWarning($"Tier '{pair.Key}': prefab '{tier.Prefab}' doesn't exist and no similar prefab was found. Fix it in the config.");
+                    continue;
+                }
+
+                PrintWarning($"Tier '{pair.Key}': prefab '{tier.Prefab}' doesn't exist; using '{match}' instead. Update the config to silence this.");
+                tier.Prefab = match;
+            }
         }
 
         private Vector3 RandomRoadPoint() => roadPoints[UnityEngine.Random.Range(0, roadPoints.Count)];
