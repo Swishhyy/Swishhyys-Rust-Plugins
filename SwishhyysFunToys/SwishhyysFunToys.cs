@@ -257,6 +257,14 @@ namespace Oxide.Plugins
                 return;
             }
             plane.Spawn();
+
+            // The stock cargo plane flies its own route and can drop a free supply crate.
+            // Remove it once the strike is over so it's only the visual.
+            timer.Once(config.AirstrikeImpactDelay + 2f, () =>
+            {
+                if (plane != null && !plane.IsDestroyed)
+                    plane.Kill();
+            });
         }
 
         private void SpawnSupplyDrop(Vector3 ground)

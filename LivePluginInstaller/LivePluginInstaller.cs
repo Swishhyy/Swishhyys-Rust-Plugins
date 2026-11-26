@@ -87,7 +87,7 @@ namespace Oxide.Plugins
             {
                 string name = Path.GetFileNameWithoutExtension(file);
                 string state;
-                if (name == SelfName)
+                if (name.Equals(SelfName, StringComparison.OrdinalIgnoreCase))
                     state = "skipped (this installer)";
                 else if (!ValidName.IsMatch(name))
                     state = "skipped (bad file name)";
@@ -118,7 +118,7 @@ namespace Oxide.Plugins
             foreach (string file in files)
             {
                 string name = Path.GetFileNameWithoutExtension(file);
-                if (name == SelfName)
+                if (name.Equals(SelfName, StringComparison.OrdinalIgnoreCase))
                 {
                     // Reloading this plugin from inside itself would cut the install short.
                     caller.Reply($"Skipped {name}: the installer can't update itself. Replace it manually.");

@@ -272,7 +272,7 @@ namespace Oxide.Plugins
             var player = initiator as BasePlayer;
             if (player != null)
             {
-                if (player.IsNpc || !player.userID.IsSteamId()) return AttackerType.Npc;
+                if (player.IsNpc || !((ulong)player.userID).IsSteamId()) return AttackerType.Npc;
                 playerAttacker = player;
                 return AttackerType.Player;
             }

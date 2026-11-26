@@ -6,9 +6,9 @@ using System.Collections.Generic;
 
 namespace Oxide.Plugins
 {
-    [Info("Clan Team", "deivismac", "1.0.7")]
+    [Info("Clan Team Reworked", "deivismac", "1.0.8")]
     [Description("Adds clan members to the same team")]
-    class ClanTeam : CovalencePlugin
+    class ClanTeamReworked : CovalencePlugin
     {
         #region Definitions
 

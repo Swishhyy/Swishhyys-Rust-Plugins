@@ -442,14 +442,14 @@ namespace Oxide.Plugins
 
             foreach (var f in type.GetFields(flags))
             {
-                if (f.FieldType == typeof(List<Vector3>) && IsRouteName(f.Name) && f.GetValue(owner) is List<Vector3> found)
+                if (f.FieldType == typeof(List<Vector3>) && IsRouteName(f.Name) && SafeGet(() => f.GetValue(owner)) is List<Vector3> found)
                     return found;
             }
 
             foreach (var p in type.GetProperties(flags))
             {
                 if (p.PropertyType == typeof(List<Vector3>) && p.CanRead && IsRouteName(p.Name)
-                    && p.GetIndexParameters().Length == 0 && p.GetValue(owner) is List<Vector3> found)
+                    && p.GetIndexParameters().Length == 0 && SafeGet(() => p.GetValue(owner)) is List<Vector3> found)
                     return found;
             }
 
@@ -458,12 +458,25 @@ namespace Oxide.Plugins
             {
                 if (f.FieldType.IsClass && f.FieldType != typeof(string) && f.FieldType.Name.ToLowerInvariant().Contains("path"))
                 {
-                    var nested = FindRouteList(f.GetValue(owner), depth - 1);
+                    var nested = FindRouteList(SafeGet(() => f.GetValue(owner)), depth - 1);
                     if (nested != null) return nested;
                 }
             }
 
             return null;
+        }
+
+        // Some engine getters throw when read by reflection; treat that member as absent.
+        private static object SafeGet(Func<object> getter)
+        {
+            try
+            {
+                return getter();
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static bool IsRouteName(string name)

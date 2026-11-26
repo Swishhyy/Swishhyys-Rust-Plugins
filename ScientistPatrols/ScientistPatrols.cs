@@ -26,7 +26,6 @@ namespace Oxide.Plugins
         private const float TickSeconds = 2f;
         private const float WaypointReachedDistance = 5f;
         private const float WaypointMaxAge = 90f;      // re-pick a waypoint if the squad seems stuck
-        private const float RaidArrivalDistance = 6f;
         private const float AttackReachDistance = 4f;
         private const float SquadSpacing = 3f;
 
@@ -483,6 +482,8 @@ namespace Oxide.Plugins
             bool stale = now - patrol.WaypointSetAt >= WaypointMaxAge;
             if (arrived || stale)
                 PickWaypoint(patrol);
+            else
+                MoveSquad(patrol, patrol.Waypoint);   // re-issue: the scientist AI can overwrite destinations between ticks
         }
 
         private void UpdateRaid(Patrol patrol, float now)
@@ -497,23 +498,31 @@ namespace Oxide.Plugins
                 return;
             }
 
+            // Each scientist attacks the target base's nearest block once it reaches one,
+            // and otherwise keeps closing in on the cupboard. Walls usually stop them well short of it.
             Vector3 targetPos = target.transform.position;
-            if (FlatDistance(patrol.Leader.transform.position, targetPos) > RaidArrivalDistance)
-            {
-                MoveSquad(patrol, targetPos);
-                return;
-            }
+            bool attackReady = now >= patrol.NextAttackAt;
+            bool attacked = false;
 
-            if (now < patrol.NextAttackAt)
-                return;
-
-            patrol.NextAttackAt = now + config.AttackInterval;
-            foreach (NPCPlayer member in patrol.Members)
+            for (int i = 0; i < patrol.Members.Count; i++)
             {
-                BaseCombatEntity block = NearestBlock(member.transform.position);
-                if (block != null)
+                NPCPlayer member = patrol.Members[i];
+                BaseCombatEntity block = NearestBlock(member.transform.position, target);
+                if (block == null)
+                {
+                    MoveTo(member, targetPos + SquadOffset(i));
+                    continue;
+                }
+
+                if (attackReady)
+                {
                     block.Hurt(patrol.Tier.AttackDamage, DamageType.Bullet, member, false);
+                    attacked = true;
+                }
             }
+
+            if (attacked)
+                patrol.NextAttackAt = now + config.AttackInterval;
         }
 
         #endregion
@@ -582,7 +591,9 @@ namespace Oxide.Plugins
             PickWaypoint(patrol);
         }
 
-        private BaseCombatEntity NearestBlock(Vector3 position)
+        // Nearest block or deployable within reach that belongs to the target base, so
+        // patrols don't chew through a different (possibly offline) base on the way.
+        private BaseCombatEntity NearestBlock(Vector3 position, BuildingPrivlidge target)
         {
             BaseCombatEntity nearest = null;
             float nearestDistance = float.MaxValue;
@@ -591,6 +602,8 @@ namespace Oxide.Plugins
             {
                 var entity = collider.GetComponentInParent<BaseCombatEntity>();
                 if (entity == null || entity is BasePlayer || entity.IsDestroyed)
+                    continue;
+                if (entity != target && entity.GetBuildingPrivilege() != target)
                     continue;
 
                 float distance = Vector3.Distance(entity.transform.position, position);
