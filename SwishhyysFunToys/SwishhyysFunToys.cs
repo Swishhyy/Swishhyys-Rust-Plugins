@@ -7,8 +7,8 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SwishhyysFunToys", "Swishhyy", "0.3.0")]
-    [Description("Fun toys: jet airstrikes, mass airdrops, meteor showers and lightning storms.")]
+    [Info("SwishhyysFunToys", "Swishhyy", "0.4.0")]
+    [Description("Fun toys: jet airstrikes and barrages, cluster missiles, mass airdrops, meteor showers and lightning storms.")]
     public class SwishhyysFunToys : RustPlugin
     {
         private const string PermUse = "swishhyysfuntoys.use";
@@ -20,6 +20,7 @@ namespace Oxide.Plugins
         private const string PrefabCargoPlane = "assets/prefabs/npc/cargo plane/cargo_plane.prefab";
         private const string PrefabBomb = "assets/content/vehicles/mlrs/rocket_mlrs.prefab";
         private const string PrefabMeteor = "assets/prefabs/ammo/rocket/rocket_fire.prefab";
+        private const string PrefabBomblet = "assets/prefabs/ammo/rocket/rocket_basic.prefab";
         private const string PrefabRock = "assets/bundled/prefabs/autospawn/resource/ores/stone-ore.prefab";
         private const string PrefabSupplyDrop = "assets/prefabs/misc/supply drop/supply_drop.prefab";
         private const string PrefabFireBall = "assets/bundled/prefabs/oilfireballsmall.prefab";
@@ -39,6 +40,8 @@ namespace Oxide.Plugins
         private const float MeteorHeight = 150f;
         private const float MeteorSlant = 70f;          // horizontal distance meteors travel while falling
         private const float ProjectileTimeout = 30f;    // safety cleanup if a projectile never lands
+        private const float ClusterHeight = 200f;
+        private const float BombletSpeed = 40f;
 
         private Configuration config;
         private readonly Dictionary<ulong, float> lastUsed = new Dictionary<ulong, float>();
@@ -51,6 +54,8 @@ namespace Oxide.Plugins
         private string bombPrefab;
         private string meteorPrefab;
         private string rockPrefab;
+        private string clusterMissilePrefab;
+        private string bombletPrefab;
         private bool fireOk;
 
         // Projectiles in flight -> what happens where they land.
@@ -64,6 +69,7 @@ namespace Oxide.Plugins
             public List<string> Effects;
             public bool Fire;
             public BaseEntity Rock;
+            public Action<Vector3> OnLand;   // replaces the normal detonation when set
         }
 
         #region Configuration
@@ -93,6 +99,42 @@ namespace Oxide.Plugins
 
             [JsonProperty("Airstrike: explosion effects (all play together)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
             public List<string> AirstrikeEffects = new List<string> { FxBigExplosion };
+
+            [JsonProperty("Airstrike barrage: default jet count")]
+            public int BarrageJets = 6;
+
+            [JsonProperty("Airstrike barrage: maximum jet count")]
+            public int BarrageMaxJets = 12;
+
+            [JsonProperty("Airstrike barrage: bombs land within this many metres of the aim point")]
+            public float BarrageSpread = 25f;
+
+            [JsonProperty("Airstrike barrage: seconds between jets")]
+            public float BarrageInterval = 2.5f;
+
+            [JsonProperty("Cluster missile: missile prefab")]
+            public string ClusterMissilePrefab = PrefabBomb;
+
+            [JsonProperty("Cluster missile: bomblet prefab")]
+            public string ClusterBombletPrefab = PrefabBomblet;
+
+            [JsonProperty("Cluster missile: fall speed (m/s)")]
+            public float ClusterSpeed = 45f;
+
+            [JsonProperty("Cluster missile: split height above the ground (m)")]
+            public float ClusterSplitHeight = 45f;
+
+            [JsonProperty("Cluster missile: bomblet count")]
+            public int ClusterBomblets = 12;
+
+            [JsonProperty("Cluster missile: radius the bomblets cover (m)")]
+            public float ClusterRadius = 20f;
+
+            [JsonProperty("Cluster missile: blast radius per bomblet (m)")]
+            public float ClusterBombletRadius = 6f;
+
+            [JsonProperty("Cluster missile: damage per bomblet at its centre")]
+            public float ClusterBombletDamage = 120f;
 
             [JsonProperty("Mass airdrop: default crate count")]
             public int DefaultCrates = 50;
@@ -182,6 +224,12 @@ namespace Oxide.Plugins
             if (SameList(config.MeteorEffects, FxRocket))
                 config.MeteorEffects = new List<string>();
             config.MeteorSpeed = Mathf.Max(10f, config.MeteorSpeed);
+            config.BarrageMaxJets = Mathf.Clamp(config.BarrageMaxJets, 1, 30);
+            config.BarrageJets = Mathf.Clamp(config.BarrageJets, 1, config.BarrageMaxJets);
+            config.BarrageInterval = Mathf.Max(0f, config.BarrageInterval);
+            config.ClusterSpeed = Mathf.Max(10f, config.ClusterSpeed);
+            config.ClusterSplitHeight = Mathf.Clamp(config.ClusterSplitHeight, 10f, ClusterHeight - 20f);
+            config.ClusterBomblets = Mathf.Clamp(config.ClusterBomblets, 1, 50);
 
             SaveConfig();
         }
@@ -211,6 +259,8 @@ namespace Oxide.Plugins
             bombPrefab = ResolvePrefab("Airstrike bomb", config.AirstrikeBombPrefab, "rocket_mlrs", "rocket_basic");
             meteorPrefab = ResolvePrefab("Meteor", config.MeteorPrefab, "rocket_fire", "rocket_basic");
             rockPrefab = config.MeteorRock ? ResolvePrefab("Meteor rock", config.MeteorRockPrefab, "stone-ore") : null;
+            clusterMissilePrefab = ResolvePrefab("Cluster missile", config.ClusterMissilePrefab, "rocket_mlrs", "rocket_basic");
+            bombletPrefab = ResolvePrefab("Cluster bomblet", config.ClusterBombletPrefab, "rocket_basic", "rocket_hv");
             fireOk = IsKnownPrefab(PrefabFireBall);
         }
 
@@ -240,6 +290,12 @@ namespace Oxide.Plugins
             if (impact.Rock != null && !impact.Rock.IsDestroyed)
                 impact.Rock.Kill();
 
+            if (impact.OnLand != null)
+            {
+                impact.OnLand(at);
+                return;
+            }
+
             Detonate(at, impact.Radius, impact.Damage, impact.Caller, impact.Effects);
             if (impact.Fire && fireOk)
                 SpawnFire(at);
@@ -258,28 +314,40 @@ namespace Oxide.Plugins
             }
 
             PrintToChat($"Air support inbound for {player.displayName}. Clear the area!");
+            RunAirstrike(target, player, 0f);
+        }
 
-            Vector2 heading = UnityEngine.Random.insideUnitCircle.normalized;
-            Vector3 direction = new Vector3(heading.x, 0f, heading.y);
-            SpawnJet(target, direction);
-
-            // Release the bomb so it lands at the impact delay.
-            float fall = BombHeight / BombSpeed;
-            float release = Mathf.Max(0.5f, config.AirstrikeImpactDelay - fall);
-            timer.Once(release, () =>
+        [ChatCommand("barrage")]
+        private void CmdBarrage(BasePlayer player, string command, string[] args)
+        {
+            if (!TryParseCount(args, config.BarrageJets, config.BarrageMaxJets, player, out int jets))
             {
-                var impact = new Impact
-                {
-                    Radius = config.AirstrikeRadius,
-                    Damage = config.AirstrikeDamage,
-                    Caller = player,
-                    Effects = airstrikeFx
-                };
+                return;
+            }
+            if (!TryStartUse(player, out Vector3 target))
+            {
+                return;
+            }
 
-                Vector3 from = target + Vector3.up * BombHeight;
-                if (!LaunchProjectile(bombPrefab, from, target, BombSpeed, impact, false))
-                    timer.Once(fall, () => Detonate(target, impact.Radius, impact.Damage, player, impact.Effects));
-            });
+            PrintToChat($"Airstrike barrage inbound for {player.displayName}: {jets} jets. Take cover!");
+            for (int i = 0; i < jets; i++)
+            {
+                // The first bomb hits the aim point; the rest spread around it.
+                Vector3 spot = i == 0 ? target : GroundAt(RandomPointInDisc(target, config.BarrageSpread), target.y);
+                RunAirstrike(spot, player, i * config.BarrageInterval);
+            }
+        }
+
+        [ChatCommand("cluster")]
+        private void CmdCluster(BasePlayer player, string command, string[] args)
+        {
+            if (!TryStartUse(player, out Vector3 target))
+            {
+                return;
+            }
+
+            PrintToChat($"Cluster missile inbound for {player.displayName}!");
+            LaunchCluster(target, player);
         }
 
         [ChatCommand("massdrop")]
@@ -347,6 +415,92 @@ namespace Oxide.Plugins
         #endregion
 
         #region Toys
+
+        // One jet pass: the jet flies over `target` from a random direction and a single bomb lands
+        // on it `AirstrikeImpactDelay` seconds after `startDelay`.
+        private void RunAirstrike(Vector3 target, BasePlayer caller, float startDelay)
+        {
+            Vector2 heading = UnityEngine.Random.insideUnitCircle.normalized;
+            Vector3 direction = new Vector3(heading.x, 0f, heading.y);
+            timer.Once(Mathf.Max(0.01f, startDelay), () => SpawnJet(target, direction));
+
+            float fall = BombHeight / BombSpeed;
+            float release = startDelay + Mathf.Max(0.5f, config.AirstrikeImpactDelay - fall);
+            timer.Once(release, () =>
+            {
+                var impact = new Impact
+                {
+                    Radius = config.AirstrikeRadius,
+                    Damage = config.AirstrikeDamage,
+                    Caller = caller,
+                    Effects = airstrikeFx
+                };
+
+                Vector3 from = target + Vector3.up * BombHeight;
+                if (!LaunchProjectile(bombPrefab, from, target, BombSpeed, impact, false))
+                    timer.Once(fall, () => Detonate(target, impact.Radius, impact.Damage, caller, impact.Effects));
+            });
+        }
+
+        // A big missile falls on the target and, at the split height, bursts into bomblets that
+        // rain across the cluster radius. If it hits something before splitting, it bursts there.
+        private void LaunchCluster(Vector3 target, BasePlayer caller)
+        {
+            Vector2 side = UnityEngine.Random.insideUnitCircle.normalized * 30f;
+            Vector3 from = target + new Vector3(side.x, ClusterHeight, side.y);
+            Vector3 splitPoint = target + Vector3.up * config.ClusterSplitHeight;
+            float splitAfter = Vector3.Distance(from, splitPoint) / config.ClusterSpeed;
+
+            // If the missile lands early, it still releases its bomblets from where it hit.
+            var missileImpact = new Impact { Radius = 0f, Damage = 0f, Caller = caller, Effects = new List<string>() };
+            if (!LaunchProjectile(clusterMissilePrefab, from, target, config.ClusterSpeed, missileImpact, false))
+            {
+                timer.Once(splitAfter, () => SplitCluster(splitPoint, target, caller));
+                return;
+            }
+
+            BaseEntity missile = projectiles.FirstOrDefault(p => p.Value == missileImpact).Key;
+            missileImpact.OnLand = at => SplitCluster(at + Vector3.up * 2f, target, caller);
+
+            timer.Once(splitAfter, () =>
+            {
+                if (missile == null || missile.IsDestroyed || !projectiles.Remove(missile))
+                    return;   // already landed and split
+                Vector3 at = missile.transform.position;
+                missile.Kill();
+                SplitCluster(at, target, caller);
+            });
+        }
+
+        private void SplitCluster(Vector3 from, Vector3 target, BasePlayer caller)
+        {
+            Effect.server.Run(IsKnownPrefab(FxRocket) ? FxRocket : FxExplosion, from);
+
+            for (int i = 0; i < config.ClusterBomblets; i++)
+            {
+                Vector3 spot = GroundAt(RandomPointInDisc(target, config.ClusterRadius), target.y);
+                float delay = UnityEngine.Random.Range(0f, 0.4f);
+                timer.Once(Mathf.Max(0.01f, delay), () =>
+                {
+                    var impact = new Impact
+                    {
+                        Radius = config.ClusterBombletRadius,
+                        Damage = config.ClusterBombletDamage,
+                        Caller = caller,
+                        Effects = new List<string>()
+                    };
+                    if (!LaunchProjectile(bombletPrefab, from, spot, BombletSpeed, impact, false))
+                        Detonate(spot, impact.Radius, impact.Damage, caller, new List<string> { FxExplosion });
+                });
+            }
+        }
+
+        // Ground height at a point, falling back to `fallbackY` if the heightmap isn't available.
+        private static Vector3 GroundAt(Vector3 point, float fallbackY)
+        {
+            point.y = TerrainMeta.HeightMap != null ? TerrainMeta.HeightMap.GetHeight(point) : fallbackY;
+            return point;
+        }
 
         // Flies the jet (or the cargo plane fallback) over the target along `direction`, then removes it.
         private void SpawnJet(Vector3 target, Vector3 direction)
