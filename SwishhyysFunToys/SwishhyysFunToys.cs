@@ -1,11 +1,13 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using Newtonsoft.Json;
 using Rust;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SwishhyysFunToys", "Swishhyy", "0.1.0")]
+    [Info("SwishhyysFunToys", "Swishhyy", "0.2.0")]
     [Description("Fun toys: cargo plane airstrikes, mass airdrops, meteor showers and lightning storms.")]
     public class SwishhyysFunToys : RustPlugin
     {
@@ -15,7 +17,14 @@ namespace Oxide.Plugins
         // Prefab paths. Confirm these against your server's build if an entity fails to spawn.
         private const string PrefabCargoPlane = "assets/prefabs/npc/cargo plane/cargo_plane.prefab";
         private const string PrefabSupplyDrop = "assets/prefabs/misc/supply drop/supply_drop.prefab";
-        private const string FxExplosion = "assets/bundled/prefabs/fx/explosions/explosion_01.prefab";
+        private const string FxExplosion = "assets/bundled/prefabs/fx/explosions/explosion_01.prefab";   // last-resort fallback
+        private const string PrefabFireBall = "assets/bundled/prefabs/oilfireballsmall.prefab";
+
+        // Effects checked against the game's prefab list at startup.
+        private List<string> airstrikeFx = new List<string> { FxExplosion };
+        private List<string> meteorFx = new List<string> { FxExplosion };
+        private List<string> lightningFx = new List<string> { FxExplosion };
+        private bool meteorFireOk;
 
         private const float DropHeight = 100f;
         private const float AirdropSpacing = 0.4f;
@@ -81,6 +90,25 @@ namespace Oxide.Plugins
 
             [JsonProperty("Lightning storm: damage at the centre")]
             public float LightningDamage = 25f;
+
+            [JsonProperty("Airstrike: explosion effects (all play together)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> AirstrikeEffects = new List<string>
+            {
+                "assets/prefabs/npc/patrol helicopter/effects/heli_explosion.prefab",
+                "assets/prefabs/tools/c4/effects/c4_explosion.prefab"
+            };
+
+            [JsonProperty("Meteor shower: impact effects", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> MeteorEffects = new List<string>
+            {
+                "assets/prefabs/weapons/rocketlauncher/effects/rocket_explosion.prefab"
+            };
+
+            [JsonProperty("Meteor shower: leave a small fire at each impact")]
+            public bool MeteorFire = true;
+
+            [JsonProperty("Lightning storm: strike effects (empty = find a lightning effect automatically)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> LightningEffects = new List<string>();
         }
 
         protected override void LoadDefaultConfig() => config = new Configuration();
@@ -111,6 +139,17 @@ namespace Oxide.Plugins
             permission.RegisterPermission(PermAdmin, this);
         }
 
+        private void OnServerInitialized()
+        {
+            airstrikeFx = ResolveEffects("Airstrike", config.AirstrikeEffects, "heli_explosion", "c4_explosion");
+            meteorFx = ResolveEffects("Meteor shower", config.MeteorEffects, "rocket_explosion", "c4_explosion");
+            lightningFx = ResolveEffects("Lightning storm", config.LightningEffects, "lightning", "tesla");
+
+            meteorFireOk = config.MeteorFire && IsKnownPrefab(PrefabFireBall);
+            if (config.MeteorFire && !meteorFireOk)
+                PrintWarning($"Meteor fire prefab '{PrefabFireBall}' doesn't exist on this server; meteors won't leave fire.");
+        }
+
         // ---------- Chat commands ----------
 
         [ChatCommand("airstrike")]
@@ -123,7 +162,7 @@ namespace Oxide.Plugins
 
             PrintToChat($"Cargo plane inbound for {player.displayName}. Clear the area!");
             SpawnCargoPlane(target);
-            timer.Once(config.AirstrikeImpactDelay, () => Detonate(target, config.AirstrikeRadius, config.AirstrikeDamage, player));
+            timer.Once(config.AirstrikeImpactDelay, () => Detonate(target, config.AirstrikeRadius, config.AirstrikeDamage, player, airstrikeFx));
         }
 
         [ChatCommand("massdrop")]
@@ -163,7 +202,12 @@ namespace Oxide.Plugins
             {
                 Vector3 spot = RandomPointInDisc(center, config.MeteorRadius);
                 float delay = UnityEngine.Random.Range(0f, config.MeteorWindow);
-                timer.Once(delay, () => Detonate(spot, config.MeteorBlastRadius, config.MeteorDamage, player));
+                timer.Once(delay, () =>
+                {
+                    Detonate(spot, config.MeteorBlastRadius, config.MeteorDamage, player, meteorFx);
+                    if (meteorFireOk)
+                        SpawnFire(spot);
+                });
             }
         }
 
@@ -184,7 +228,7 @@ namespace Oxide.Plugins
             {
                 Vector3 spot = RandomPointInDisc(center, config.LightningRadius);
                 float delay = UnityEngine.Random.Range(0f, config.LightningWindow);
-                timer.Once(delay, () => Detonate(spot, 2f, config.LightningDamage, player));
+                timer.Once(delay, () => Detonate(spot, 2f, config.LightningDamage, player, lightningFx));
             }
         }
 
@@ -279,10 +323,11 @@ namespace Oxide.Plugins
             drop.Spawn();
         }
 
-        /// Plays an explosion at `center` and damages players within `radius`, falling off with distance.
-        private void Detonate(Vector3 center, float radius, float damage, BasePlayer caller)
+        /// Plays the toy's effects at `center` and damages players within `radius`, falling off with distance.
+        private void Detonate(Vector3 center, float radius, float damage, BasePlayer caller, List<string> effects)
         {
-            Effect.server.Run(FxExplosion, center);
+            foreach (string fx in effects)
+                Effect.server.Run(fx, center);
 
             foreach (BasePlayer victim in BasePlayer.activePlayerList)
             {
@@ -300,6 +345,74 @@ namespace Oxide.Plugins
                 float falloff = 1f - distance / radius;
                 victim.Hurt(damage * falloff, DamageType.Explosion, caller, false);
             }
+        }
+
+        // ---------- Effects ----------
+
+        // Keeps configured effects that exist on this server. If none do, looks for one in the game's
+        // prefab list by keyword, and as a last resort uses the generic explosion. Logs what it picked.
+        private List<string> ResolveEffects(string toy, List<string> configured, params string[] keywords)
+        {
+            var found = new List<string>();
+            foreach (string path in configured ?? new List<string>())
+            {
+                if (IsKnownPrefab(path))
+                    found.Add(path);
+                else
+                    PrintWarning($"{toy}: effect '{path}' doesn't exist on this server.");
+            }
+            if (found.Count > 0)
+                return found;
+
+            foreach (string keyword in keywords)
+            {
+                string match = FindEffect(keyword);
+                if (match == null)
+                    continue;
+                Puts($"{toy}: using effect '{match}'. Put it (or another effect) in the config to choose your own.");
+                found.Add(match);
+                return found;
+            }
+
+            PrintWarning($"{toy}: no matching effect found; using the generic explosion.");
+            found.Add(FxExplosion);
+            return found;
+        }
+
+        private static bool IsKnownPrefab(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return false;
+            try
+            {
+                return StringPool.toNumber.ContainsKey(path);
+            }
+            catch
+            {
+                return true;   // can't check on this build; trust the config
+            }
+        }
+
+        private static string FindEffect(string keyword)
+        {
+            try
+            {
+                return StringPool.toNumber.Keys
+                    .Where(k => k.EndsWith(".prefab") && k.Contains(keyword) && (k.Contains("/effects/") || k.Contains("/fx/")))
+                    .OrderBy(k => k.Length)
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void SpawnFire(Vector3 position)
+        {
+            BaseEntity fire = GameManager.server.CreateEntity(PrefabFireBall, position + Vector3.up * 0.3f, Quaternion.identity);
+            if (fire != null)
+                fire.Spawn();
         }
     }
 }
