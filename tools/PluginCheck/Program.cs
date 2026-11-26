@@ -38,18 +38,24 @@ internal static class Program
     {
         if (args.Length == 0 || args[0] == "--help" || args[0] == "-h")
         {
-            Console.WriteLine("Usage: PluginCheck <repo-root> [--refs <RustDedicated_Data/Managed>] [--lang <C# version, e.g. 9>]");
+            Console.WriteLine("Usage: PluginCheck <repo-root> [--refs <RustDedicated_Data/Managed>] [--exclude a.dll,b.dll] [--lang <C# version, e.g. 9>]");
             return 2;
         }
 
         string root = Path.GetFullPath(args[0]);
         string refsDir = null;
+        var exclude = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         LanguageVersion lang = LanguageVersion.CSharp9;
 
         for (int i = 1; i < args.Length; i++)
         {
             if (args[i] == "--refs" && i + 1 < args.Length)
                 refsDir = Path.GetFullPath(args[++i]);
+            else if (args[i] == "--exclude" && i + 1 < args.Length)
+            {
+                foreach (string name in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    exclude.Add(name);
+            }
             else if (args[i] == "--lang" && i + 1 < args.Length)
             {
                 if (!LanguageVersionFacts.TryParse(args[++i], out lang))
@@ -66,7 +72,12 @@ internal static class Program
         }
 
         bool partial = refsDir == null;
-        List<MetadataReference> references = partial ? DefaultReferences() : LoadReferences(refsDir);
+        // Oxide ships its own Json.NET inside Oxide.References.dll, and plugins compile against that.
+        // Rust's separate Newtonsoft.Json.dll would make every JSON type ambiguous, so leave it out.
+        if (!partial && File.Exists(Path.Combine(refsDir, "Oxide.References.dll")) && exclude.Add("Newtonsoft.Json.dll"))
+            Console.WriteLine("Note: using Json.NET from Oxide.References.dll (Newtonsoft.Json.dll excluded).");
+
+        List<MetadataReference> references = partial ? DefaultReferences() : LoadReferences(refsDir, exclude);
         if (references.Count == 0)
         {
             Console.Error.WriteLine($"No .NET assemblies found in {refsDir}");
@@ -161,7 +172,7 @@ internal static class Program
     }
 
     // Every managed DLL in the folder; native DLLs are skipped.
-    private static List<MetadataReference> LoadReferences(string dir)
+    private static List<MetadataReference> LoadReferences(string dir, HashSet<string> exclude)
     {
         var references = new List<MetadataReference>();
         if (!Directory.Exists(dir))
@@ -169,6 +180,8 @@ internal static class Program
 
         foreach (string path in Directory.GetFiles(dir, "*.dll"))
         {
+            if (exclude.Contains(Path.GetFileName(path)))
+                continue;
             try
             {
                 using (FileStream stream = File.OpenRead(path))

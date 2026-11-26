@@ -28,6 +28,7 @@ This only checks C# syntax and use of .NET and Newtonsoft. Rust, Oxide and Unity
 ## Options
 
 - `--lang 9` sets the C# version (default 9). Raise it if your Oxide build supports newer C#.
+- `--exclude a.dll,b.dll` leaves DLLs out of a full check. Use it if two DLLs define the same type (error CS0433). `Newtonsoft.Json.dll` is left out automatically when `Oxide.References.dll` is present, because Oxide plugins use the Json.NET inside Oxide's own assembly.
 
 ## What it doesn't do
 
