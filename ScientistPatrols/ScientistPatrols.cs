@@ -5,29 +5,35 @@ using System.Linq;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Plugins;
+using Rust;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("ScientistPatrols", "Swishhyy", "0.1.0")]
-    [Description("Scientist patrols that roam the roads and raid bases whose owners are online")]
+    [Info("ScientistPatrols", "Swishhyy", "0.2.0")]
+    [Description("Tiered scientist patrols that roam the roads, show on the map, and raid bases whose owners are online")]
     public class ScientistPatrols : RustPlugin
     {
         #region Constants & State
 
         private const string PermAdmin = "scientistpatrols.admin";
 
-        // Unverified on this build: confirm the scientist prefab path on your server.
-        private const string ScientistPath = "assets/prefabs/npc/scientist/scientist.prefab";
+        private const string RoamScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_roam.prefab";
+        private const string HeavyScientistPrefab = "assets/rust.ai/agents/npcplayer/humannpc/heavyscientist/heavyscientist.prefab";
+        private const string GenericMarkerPrefab = "assets/prefabs/tools/map/genericradiusmarker.prefab";
+        private const string LabelMarkerPrefab = "assets/prefabs/deployable/vendingmachine/vending_mapmarker.prefab";
+
         private const float TickSeconds = 2f;
         private const float WaypointReachedDistance = 5f;
-        private const float WaypointMaxAge = 90f;      // re-pick a waypoint if the navigator seems stuck
+        private const float WaypointMaxAge = 90f;      // re-pick a waypoint if the squad seems stuck
         private const float RaidArrivalDistance = 6f;
         private const float AttackReachDistance = 4f;
+        private const float SquadSpacing = 3f;
 
         private Configuration config;
         private readonly List<Patrol> patrols = new List<Patrol>();
         private readonly Dictionary<string, float> baseCooldowns = new Dictionary<string, float>();
+        private readonly HashSet<string> warned = new HashSet<string>();
         private List<Vector3> roadPoints;
         private int blockMask;
 
@@ -35,23 +41,63 @@ namespace Oxide.Plugins
 
         private sealed class Patrol
         {
-            public NPCPlayer Npc;
+            public string TierKey;
+            public TierConfig Tier;
+            public readonly List<NPCPlayer> Members = new List<NPCPlayer>();
             public PatrolState State;
             public Vector3 Waypoint;
             public float WaypointSetAt;
             public float SpawnedAt;
             public BuildingPrivlidge Target;
-            public string TargetKey;
             public float RaidEndsAt;
             public float NextAttackAt;
+            public MapMarker Marker;
+
+            public NPCPlayer Leader => Members.Count > 0 ? Members[0] : null;
         }
 
         #endregion
 
         #region Configuration
 
+        private class TierConfig
+        {
+            [JsonProperty("Name shown on the map and in chat")]
+            public string DisplayName = "Patrol";
+
+            [JsonProperty("Scientist prefab")]
+            public string Prefab = RoamScientistPrefab;
+
+            [JsonProperty("Scientists per patrol")]
+            public int SquadSize = 3;
+
+            [JsonProperty("Health per scientist (0 = prefab default)")]
+            public float Health = 0f;
+
+            [JsonProperty("Replace the prefab's loadout")]
+            public bool ReplaceLoadout = false;
+
+            [JsonProperty("Weapon shortname (when replacing the loadout)")]
+            public string Weapon = "";
+
+            [JsonProperty("Clothing shortnames (when replacing the loadout)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> Wear = new List<string>();
+
+            [JsonProperty("Spawn weight (higher = more common)")]
+            public float SpawnWeight = 1f;
+
+            [JsonProperty("Damage per attack on a building block")]
+            public float AttackDamage = 20f;
+
+            [JsonProperty("Map marker colour (hex)")]
+            public string MarkerColor = "#FFB300";
+        }
+
         private class Configuration
         {
+            [JsonProperty("Patrol tiers", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, TierConfig> Tiers = DefaultTiers();
+
             [JsonProperty("Max patrols at once")]
             public int MaxPatrols = 3;
 
@@ -64,10 +110,16 @@ namespace Oxide.Plugins
             [JsonProperty("Roam radius around a patrol for its next road point (m)")]
             public float WanderRadius = 150f;
 
+            [JsonProperty("Show patrols on the map")]
+            public bool ShowOnMap = true;
+
+            [JsonProperty("Map marker radius")]
+            public float MarkerRadius = 0.2f;
+
             [JsonProperty("Chance a patrol spawn or raid is announced in chat (%)")]
             public float AnnounceChancePercent = 50f;
 
-            [JsonProperty("Chance per check that an idle patrol picks a base to raid (%)")]
+            [JsonProperty("Chance per check that a roaming patrol picks a base to raid (%)")]
             public float RaidChancePercent = 25f;
 
             [JsonProperty("Seconds between raid checks")]
@@ -85,11 +137,43 @@ namespace Oxide.Plugins
             [JsonProperty("Only raid bases where an owner is online")]
             public bool RequireOwnerOnline = true;
 
-            [JsonProperty("Damage per attack on a building block")]
-            public float AttackDamage = 20f;
-
             [JsonProperty("Seconds between attacks while raiding")]
             public float AttackInterval = 2f;
+
+            public static Dictionary<string, TierConfig> DefaultTiers() =>
+                new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["light"] = new TierConfig
+                    {
+                        DisplayName = "Light Patrol",
+                        Prefab = RoamScientistPrefab,
+                        SquadSize = 2,
+                        ReplaceLoadout = true,
+                        Weapon = "pistol.semiauto",
+                        Wear = new List<string> { "hoodie", "pants", "shoes.boots" },
+                        SpawnWeight = 50f,
+                        AttackDamage = 10f,
+                        MarkerColor = "#7CB342"
+                    },
+                    ["normal"] = new TierConfig
+                    {
+                        DisplayName = "Patrol",
+                        Prefab = RoamScientistPrefab,
+                        SquadSize = 3,
+                        SpawnWeight = 35f,
+                        AttackDamage = 20f,
+                        MarkerColor = "#FFB300"
+                    },
+                    ["heavy"] = new TierConfig
+                    {
+                        DisplayName = "Heavy Patrol",
+                        Prefab = HeavyScientistPrefab,
+                        SquadSize = 2,
+                        SpawnWeight = 15f,
+                        AttackDamage = 40f,
+                        MarkerColor = "#E53935"
+                    }
+                };
         }
 
         protected override void LoadDefaultConfig() => config = new Configuration();
@@ -101,6 +185,17 @@ namespace Oxide.Plugins
             {
                 config = Config.ReadObject<Configuration>();
                 if (config == null) throw new JsonException("config file is empty");
+
+                config.Tiers = config.Tiers == null || config.Tiers.Count == 0
+                    ? Configuration.DefaultTiers()
+                    : new Dictionary<string, TierConfig>(config.Tiers, StringComparer.OrdinalIgnoreCase);
+                foreach (TierConfig tier in config.Tiers.Values)
+                {
+                    if (tier == null) continue;
+                    tier.SquadSize = Mathf.Clamp(tier.SquadSize, 1, 10);
+                    tier.Wear = tier.Wear ?? new List<string>();
+                }
+
                 config.MaxPatrols = Mathf.Max(0, config.MaxPatrols);
                 config.SpawnIntervalMinutes = Mathf.Max(1f, config.SpawnIntervalMinutes);
                 config.RaidCheckSeconds = Mathf.Max(5f, config.RaidCheckSeconds);
@@ -145,17 +240,13 @@ namespace Oxide.Plugins
 
         private void Unload()
         {
-            foreach (Patrol patrol in patrols)
-            {
-                if (patrol.Npc != null && !patrol.Npc.IsDestroyed)
-                    patrol.Npc.Kill();
-            }
-            patrols.Clear();
+            foreach (Patrol patrol in patrols.ToList())
+                RemovePatrol(patrol);
         }
 
         #endregion
 
-        #region Command
+        #region Command & API
 
         [ChatCommand("patrol")]
         private void CmdPatrol(BasePlayer player, string command, string[] args)
@@ -172,8 +263,52 @@ namespace Oxide.Plugins
                 return;
             }
 
-            bool spawned = SpawnPatrol();
+            string tier = args.Length > 0 ? args[0] : "random";
+            if (!tier.Equals("random", StringComparison.OrdinalIgnoreCase) && !config.Tiers.ContainsKey(tier))
+            {
+                player.ChatMessage($"Unknown tier '{tier}'. Tiers: random, {string.Join(", ", config.Tiers.Keys)}");
+                return;
+            }
+
+            bool spawned = SpawnPatrolAt(RandomRoadPoint(), tier);
             player.ChatMessage(spawned ? "Spawned a scientist patrol." : "Could not spawn a patrol. Check the console.");
+        }
+
+        // API for other plugins (RoadBradley uses this):
+        // ScientistPatrols.Call("SpawnPatrolAt", position, "light" | "normal" | "heavy" | "random")
+        private bool SpawnPatrolAt(Vector3 position, string tierKey)
+        {
+            string key = ResolveTierKey(tierKey);
+            TierConfig tier;
+            if (key == null || !config.Tiers.TryGetValue(key, out tier) || tier == null)
+            {
+                PrintWarning($"Unknown patrol tier '{tierKey}'.");
+                return false;
+            }
+
+            var patrol = new Patrol
+            {
+                TierKey = key,
+                Tier = tier,
+                State = PatrolState.Roaming,
+                SpawnedAt = Time.realtimeSinceStartup
+            };
+
+            for (int i = 0; i < tier.SquadSize; i++)
+            {
+                NPCPlayer npc = SpawnScientist(tier, position + SquadOffset(i) + Vector3.up * 0.5f);
+                if (npc != null)
+                    patrol.Members.Add(npc);
+            }
+
+            if (patrol.Members.Count == 0)
+                return false;
+
+            patrols.Add(patrol);
+            if (config.ShowOnMap)
+                patrol.Marker = MapMarker.Create(patrol.Leader.transform.position, tier.MarkerColor, tier.DisplayName, config.MarkerRadius);
+            PickWaypoint(patrol);
+            return true;
         }
 
         #endregion
@@ -182,47 +317,89 @@ namespace Oxide.Plugins
 
         private void TrySpawnPatrol()
         {
-            if (patrols.Count >= config.MaxPatrols)
+            if (patrols.Count >= config.MaxPatrols || roadPoints == null || roadPoints.Count == 0)
                 return;
 
-            if (SpawnPatrol() && Chance(config.AnnounceChancePercent))
-                rust.BroadcastChat("A scientist patrol is out on the roads.");
+            string key = PickTier();
+            if (SpawnPatrolAt(RandomRoadPoint(), key) && Chance(config.AnnounceChancePercent))
+                rust.BroadcastChat($"A {config.Tiers[key].DisplayName} is out on the roads.");
         }
 
-        private bool SpawnPatrol()
+        private NPCPlayer SpawnScientist(TierConfig tier, Vector3 position)
         {
-            if (roadPoints == null || roadPoints.Count == 0)
-                return false;
-
-            Vector3 start = roadPoints[UnityEngine.Random.Range(0, roadPoints.Count)];
-            var npc = GameManager.server.CreateEntity(ScientistPath, start + Vector3.up * 0.5f, Quaternion.identity) as NPCPlayer;
+            var npc = GameManager.server.CreateEntity(tier.Prefab, position, Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f)) as NPCPlayer;
             if (npc == null)
             {
-                PrintWarning($"Could not spawn scientist prefab: {ScientistPath}");
-                return false;
+                WarnOnce("prefab:" + tier.Prefab, $"Could not spawn scientist prefab: {tier.Prefab}");
+                return null;
             }
 
+            npc.EnableSaving(false);
             npc.Spawn();
+
             var navigator = npc.GetComponent<BaseNavigator>();
             if (navigator != null)
                 navigator.PlaceOnNavMesh(0f);
 
-            var patrol = new Patrol
+            if (tier.Health > 0f)
+                npc.InitializeHealth(tier.Health, tier.Health);
+
+            if (tier.ReplaceLoadout)
+                ApplyLoadout(npc, tier);
+
+            return npc;
+        }
+
+        private void ApplyLoadout(NPCPlayer npc, TierConfig tier)
+        {
+            npc.inventory.Strip();
+
+            foreach (string shortname in tier.Wear)
             {
-                Npc = npc,
-                State = PatrolState.Roaming,
-                SpawnedAt = Time.realtimeSinceStartup
-            };
-            patrols.Add(patrol);
-            PickWaypoint(patrol);
-            return true;
+                Item clothing = ItemManager.CreateByName(shortname);
+                if (clothing == null)
+                {
+                    WarnOnce("item:" + shortname, $"Item '{shortname}' doesn't exist on this server.");
+                    continue;
+                }
+                if (!clothing.MoveToContainer(npc.inventory.containerWear))
+                    clothing.Remove();
+            }
+
+            if (!string.IsNullOrEmpty(tier.Weapon))
+            {
+                Item weapon = ItemManager.CreateByName(tier.Weapon);
+                if (weapon == null)
+                {
+                    WarnOnce("item:" + tier.Weapon, $"Item '{tier.Weapon}' doesn't exist on this server.");
+                }
+                else if (!weapon.MoveToContainer(npc.inventory.containerBelt, 0))
+                {
+                    weapon.Remove();
+                }
+                else
+                {
+                    var gun = weapon.GetHeldEntity() as BaseProjectile;
+                    if (gun != null)
+                        gun.primaryMagazine.contents = gun.primaryMagazine.capacity;
+                    npc.UpdateActiveItem(weapon.uid);
+                }
+            }
+
+            npc.SendNetworkUpdate();
         }
 
         private void RemovePatrol(Patrol patrol)
         {
             patrols.Remove(patrol);
-            if (patrol.Npc != null && !patrol.Npc.IsDestroyed)
-                patrol.Npc.Kill();
+            foreach (NPCPlayer npc in patrol.Members)
+            {
+                if (npc != null && !npc.IsDestroyed)
+                    npc.Kill();
+            }
+            patrol.Members.Clear();
+            patrol.Marker?.Destroy();
+            patrol.Marker = null;
         }
 
         #endregion
@@ -231,16 +408,25 @@ namespace Oxide.Plugins
 
         private void PickWaypoint(Patrol patrol)
         {
-            Vector3 from = patrol.Npc.transform.position;
+            Vector3 from = patrol.Leader.transform.position;
             List<Vector3> nearby = roadPoints
-                .Where(p => FlatDistance(p, from) <= config.WanderRadius && FlatDistance(p, from) > WaypointReachedDistance)
+                .Where(p =>
+                {
+                    float d = FlatDistance(p, from);
+                    return d <= config.WanderRadius && d > WaypointReachedDistance;
+                })
                 .ToList();
 
-            patrol.Waypoint = nearby.Count > 0
-                ? nearby[UnityEngine.Random.Range(0, nearby.Count)]
-                : roadPoints[UnityEngine.Random.Range(0, roadPoints.Count)];
+            patrol.Waypoint = nearby.Count > 0 ? nearby[UnityEngine.Random.Range(0, nearby.Count)] : RandomRoadPoint();
             patrol.WaypointSetAt = Time.realtimeSinceStartup;
-            MoveTo(patrol.Npc, patrol.Waypoint);
+            MoveSquad(patrol, patrol.Waypoint);
+        }
+
+        // The leader heads for the destination; the rest spread out around it.
+        private static void MoveSquad(Patrol patrol, Vector3 destination)
+        {
+            for (int i = 0; i < patrol.Members.Count; i++)
+                MoveTo(patrol.Members[i], destination + SquadOffset(i));
         }
 
         private static void MoveTo(NPCPlayer npc, Vector3 destination)
@@ -250,21 +436,29 @@ namespace Oxide.Plugins
                 navigator.SetDestination(destination, BaseNavigator.NavigationSpeed.Normal, 1f, 0f);
         }
 
+        private static Vector3 SquadOffset(int index)
+        {
+            if (index == 0)
+                return Vector3.zero;
+            float angle = index * 2.4f;
+            return new Vector3(Mathf.Cos(angle), 0f, Mathf.Sin(angle)) * SquadSpacing;
+        }
+
         #endregion
 
         #region Ticks
 
-        // Runs every TickSeconds: drives roaming and raiding for each patrol.
+        // Runs every TickSeconds: prunes dead scientists, drives roaming and raiding, moves map markers.
         private void Tick()
         {
             float now = Time.realtimeSinceStartup;
 
-            for (int i = patrols.Count - 1; i >= 0; i--)
+            foreach (Patrol patrol in patrols.ToList())
             {
-                Patrol patrol = patrols[i];
-                if (patrol.Npc == null || patrol.Npc.IsDestroyed)
+                patrol.Members.RemoveAll(m => m == null || m.IsDestroyed || m.IsDead());
+                if (patrol.Members.Count == 0)
                 {
-                    patrols.RemoveAt(i);
+                    RemovePatrol(patrol);
                     continue;
                 }
 
@@ -278,12 +472,14 @@ namespace Oxide.Plugins
                     UpdateRaid(patrol, now);
                 else
                     UpdateRoam(patrol, now);
+
+                patrol.Marker?.MoveTo(patrol.Leader.transform.position);
             }
         }
 
         private void UpdateRoam(Patrol patrol, float now)
         {
-            bool arrived = FlatDistance(patrol.Npc.transform.position, patrol.Waypoint) <= WaypointReachedDistance;
+            bool arrived = FlatDistance(patrol.Leader.transform.position, patrol.Waypoint) <= WaypointReachedDistance;
             bool stale = now - patrol.WaypointSetAt >= WaypointMaxAge;
             if (arrived || stale)
                 PickWaypoint(patrol);
@@ -302,18 +498,21 @@ namespace Oxide.Plugins
             }
 
             Vector3 targetPos = target.transform.position;
-            if (FlatDistance(patrol.Npc.transform.position, targetPos) > RaidArrivalDistance)
+            if (FlatDistance(patrol.Leader.transform.position, targetPos) > RaidArrivalDistance)
             {
-                MoveTo(patrol.Npc, targetPos);
+                MoveSquad(patrol, targetPos);
                 return;
             }
 
-            if (now >= patrol.NextAttackAt)
+            if (now < patrol.NextAttackAt)
+                return;
+
+            patrol.NextAttackAt = now + config.AttackInterval;
+            foreach (NPCPlayer member in patrol.Members)
             {
-                patrol.NextAttackAt = now + config.AttackInterval;
-                BaseCombatEntity block = NearestBlock(patrol.Npc.transform.position);
+                BaseCombatEntity block = NearestBlock(member.transform.position);
                 if (block != null)
-                    block.Hurt(config.AttackDamage, DamageType.Bullet, patrol.Npc, false);
+                    block.Hurt(patrol.Tier.AttackDamage, DamageType.Bullet, member, false);
             }
         }
 
@@ -328,25 +527,24 @@ namespace Oxide.Plugins
                 return;
 
             float now = Time.realtimeSinceStartup;
-            List<BuildingPrivlidge> bases = UnityEngine.Object.FindObjectsOfType<BuildingPrivlidge>().ToList();
+            BuildingPrivlidge[] bases = UnityEngine.Object.FindObjectsOfType<BuildingPrivlidge>();
 
             foreach (Patrol patrol in patrols.ToList())
             {
-                if (patrol.State != PatrolState.Roaming || !Chance(config.RaidChancePercent))
+                if (patrol.State != PatrolState.Roaming || patrol.Leader == null || !Chance(config.RaidChancePercent))
                     continue;
 
                 BuildingPrivlidge best = null;
                 float bestDistance = float.MaxValue;
-                Vector3 from = patrol.Npc.transform.position;
+                Vector3 from = patrol.Leader.transform.position;
 
                 foreach (BuildingPrivlidge priv in bases)
                 {
                     if (priv == null || priv.IsDestroyed || priv.net == null)
                         continue;
 
-                    string key = KeyOf(priv);
                     float cooldownEnds;
-                    if (baseCooldowns.TryGetValue(key, out cooldownEnds) && now < cooldownEnds)
+                    if (baseCooldowns.TryGetValue(KeyOf(priv), out cooldownEnds) && now < cooldownEnds)
                         continue;
 
                     if (config.RequireOwnerOnline && !AnyOwnerOnline(priv))
@@ -369,20 +567,18 @@ namespace Oxide.Plugins
         {
             patrol.State = PatrolState.Raiding;
             patrol.Target = target;
-            patrol.TargetKey = KeyOf(target);
             patrol.RaidEndsAt = now + config.RaidMinutes * 60f;
             patrol.NextAttackAt = now;
-            baseCooldowns[patrol.TargetKey] = now + config.BaseCooldownMinutes * 60f;
+            baseCooldowns[KeyOf(target)] = now + config.BaseCooldownMinutes * 60f;
 
             if (Chance(config.AnnounceChancePercent))
-                rust.BroadcastChat("Scientists are raiding a base!");
+                rust.BroadcastChat($"A {patrol.Tier.DisplayName} is raiding a base!");
         }
 
         private void EndRaid(Patrol patrol)
         {
             patrol.State = PatrolState.Roaming;
             patrol.Target = null;
-            patrol.TargetKey = null;
             PickWaypoint(patrol);
         }
 
@@ -409,7 +605,102 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Map markers
+
+        // A coloured dot plus a hover label, moved as the patrol moves.
+        private sealed class MapMarker
+        {
+            private MapMarkerGenericRadius _dot;
+            private VendingMachineMapMarker _label;
+
+            public static MapMarker Create(Vector3 position, string hexColor, string text, float radius)
+            {
+                var marker = new MapMarker();
+                Color color;
+                if (!ColorUtility.TryParseHtmlString(hexColor, out color))
+                    color = Color.red;
+
+                marker._dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
+                if (marker._dot != null)
+                {
+                    marker._dot.EnableSaving(false);
+                    marker._dot.alpha = 0.8f;
+                    marker._dot.color1 = color;
+                    marker._dot.color2 = Color.black;
+                    marker._dot.radius = radius;
+                    marker._dot.Spawn();
+                    marker._dot.SendUpdate();
+                }
+
+                marker._label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
+                if (marker._label != null)
+                {
+                    marker._label.EnableSaving(false);
+                    marker._label.markerShopName = text;
+                    marker._label.Spawn();
+                }
+
+                return marker;
+            }
+
+            public void MoveTo(Vector3 position)
+            {
+                if (_dot != null && !_dot.IsDestroyed)
+                {
+                    _dot.transform.position = position;
+                    _dot.SendUpdate();
+                }
+                if (_label != null && !_label.IsDestroyed)
+                {
+                    _label.transform.position = position;
+                    _label.SendNetworkUpdate();
+                }
+            }
+
+            public void Destroy()
+            {
+                if (_dot != null && !_dot.IsDestroyed)
+                    _dot.Kill();
+                if (_label != null && !_label.IsDestroyed)
+                    _label.Kill();
+            }
+        }
+
+        #endregion
+
         #region Helpers
+
+        private string ResolveTierKey(string key)
+        {
+            if (string.IsNullOrEmpty(key) || key.Equals("random", StringComparison.OrdinalIgnoreCase))
+                return PickTier();
+            return config.Tiers.ContainsKey(key) ? config.Tiers.Keys.First(k => k.Equals(key, StringComparison.OrdinalIgnoreCase)) : null;
+        }
+
+        // Weighted random tier.
+        private string PickTier()
+        {
+            float total = config.Tiers.Values.Sum(t => t == null ? 0f : Mathf.Max(0f, t.SpawnWeight));
+            if (total <= 0f)
+                return config.Tiers.Keys.FirstOrDefault();
+
+            float roll = UnityEngine.Random.Range(0f, total);
+            foreach (KeyValuePair<string, TierConfig> pair in config.Tiers)
+            {
+                roll -= pair.Value == null ? 0f : Mathf.Max(0f, pair.Value.SpawnWeight);
+                if (roll < 0f)
+                    return pair.Key;
+            }
+            return config.Tiers.Keys.Last();
+        }
+
+        private Vector3 RandomRoadPoint() => roadPoints[UnityEngine.Random.Range(0, roadPoints.Count)];
+
+        private void WarnOnce(string key, string message)
+        {
+            if (warned.Add(key))
+                PrintWarning(message);
+        }
 
         private static bool Chance(float percent) => UnityEngine.Random.Range(0f, 100f) < percent;
 

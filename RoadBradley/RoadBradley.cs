@@ -10,17 +10,25 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Road Bradley", "you", "0.1.0")]
-    [Description("Spawns a Bradley APC that roams the road network between random road points.")]
+    [Info("Road Bradley", "you", "0.2.0")]
+    [Description("Spawns a Bradley APC that roams the road network, shows on the map, and leaves scientist patrols behind when destroyed.")]
     public class RoadBradley : RustPlugin
     {
-        // Prefab name is learned from a real BradleyAPC on this server (vanilla or ours),
-        // so no hard-coded asset path is needed.
-        private string _bradleyPrefab;
+        // Standard Bradley prefab. A real BradleyAPC seen on this server overrides it.
+        private const string DefaultBradleyPrefab = "assets/prefabs/npc/m2bradley/bradleyapc.prefab";
+        private const string GenericMarkerPrefab = "assets/prefabs/tools/map/genericradiusmarker.prefab";
+        private const string LabelMarkerPrefab = "assets/prefabs/deployable/vendingmachine/vending_mapmarker.prefab";
+        private const float MarkerUpdateSeconds = 2f;
+
+        private string _bradleyPrefab = DefaultBradleyPrefab;
+        private bool _prefabLearned;
+
+        [PluginReference] private Plugin ScientistPatrols;
 
         private Configuration _config;
         private readonly List<BradleyAPC> _active = new List<BradleyAPC>();
         private readonly Dictionary<BradleyAPC, Timer> _despawnTimers = new Dictionary<BradleyAPC, Timer>();
+        private readonly Dictionary<BradleyAPC, MapMarker> _markers = new Dictionary<BradleyAPC, MapMarker>();
         private Timer _spawnTimer;
         private List<Vector3> _roadPoints;
 
@@ -42,6 +50,27 @@ namespace Oxide.Plugins
 
             [JsonProperty("Spawn on first server start")]
             public bool SpawnOnStart = true;
+
+            [JsonProperty("Scientist patrols left behind when destroyed (needs ScientistPatrols)")]
+            public int PatrolsOnDeath = 2;
+
+            [JsonProperty("Tier of those patrols (light, normal, heavy or random)")]
+            public string PatrolTierOnDeath = "random";
+
+            [JsonProperty("Announce when a road Bradley is destroyed")]
+            public bool AnnounceDeath = true;
+
+            [JsonProperty("Show road Bradleys on the map")]
+            public bool ShowOnMap = true;
+
+            [JsonProperty("Map marker label")]
+            public string MarkerLabel = "Road Bradley";
+
+            [JsonProperty("Map marker colour (hex)")]
+            public string MarkerColor = "#8E24AA";
+
+            [JsonProperty("Map marker radius")]
+            public float MarkerRadius = 0.25f;
         }
 
         protected override void LoadConfig()
@@ -87,13 +116,13 @@ namespace Oxide.Plugins
             if (existing != null)
             {
                 _bradleyPrefab = existing.PrefabName;
+                _prefabLearned = true;
             }
 
-            Puts(_bradleyPrefab == null
-                ? "No Bradley exists yet; the prefab name will be learned when one spawns."
-                : $"Using Bradley prefab: {_bradleyPrefab}");
+            Puts($"Using Bradley prefab: {_bradleyPrefab}");
 
             _spawnTimer = timer.Every(_config.SpawnIntervalMinutes * 60f, TrySpawn);
+            timer.Every(MarkerUpdateSeconds, UpdateMarkers);
             if (_config.SpawnOnStart) TrySpawn();
         }
 
@@ -102,6 +131,9 @@ namespace Oxide.Plugins
             _spawnTimer?.Destroy();
             foreach (var t in _despawnTimers.Values) t?.Destroy();
             _despawnTimers.Clear();
+
+            foreach (var marker in _markers.Values) marker.Destroy();
+            _markers.Clear();
 
             foreach (var apc in _active.ToList())
             {
@@ -113,17 +145,35 @@ namespace Oxide.Plugins
         private void OnEntitySpawned(BaseNetworkable entity)
         {
             var apc = entity as BradleyAPC;
-            if (apc != null && _bradleyPrefab == null)
+            if (apc != null && !_prefabLearned)
             {
                 _bradleyPrefab = apc.PrefabName;
+                _prefabLearned = true;
                 Puts($"Learned Bradley prefab: {_bradleyPrefab}");
             }
+        }
+
+        // Fires when the Bradley is destroyed by damage (not when it despawns).
+        private void OnEntityDeath(BradleyAPC apc, HitInfo info)
+        {
+            if (apc == null || !_active.Contains(apc)) return;
+
+            Vector3 wreck = apc.transform.position;
+            if (_config.AnnounceDeath)
+                rust.BroadcastChat("The road Bradley is down. Scientists are moving in to secure the wreck!");
+
+            SpawnDeathPatrols(wreck);
         }
 
         private void OnEntityKill(BaseNetworkable entity)
         {
             var apc = entity as BradleyAPC;
-            if (apc == null || !_active.Contains(apc)) return;
+            if (apc == null) return;
+
+            // The despawn timer drops the APC from _active before killing it, so always clear its marker.
+            RemoveMarker(apc);
+
+            if (!_active.Contains(apc)) return;
 
             _active.Remove(apc);
             if (_despawnTimers.TryGetValue(apc, out var t))
@@ -175,12 +225,6 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            if (_bradleyPrefab == null)
-            {
-                reason = "no Bradley prefab path found on this server (check the console for the list tried)";
-                return false;
-            }
-
             var start = _roadPoints[UnityEngine.Random.Range(0, _roadPoints.Count)];
             var entity = GameManager.server.CreateEntity(_bradleyPrefab, start + Vector3.up * 0.5f, Quaternion.identity);
             if (entity == null)
@@ -202,7 +246,120 @@ namespace Oxide.Plugins
             _active.Add(apc);
             SetRoute(apc, start);
             ScheduleDespawn(apc);
+
+            if (_config.ShowOnMap)
+                _markers[apc] = MapMarker.Create(apc.transform.position, _config.MarkerColor, _config.MarkerLabel, _config.MarkerRadius);
             return true;
+        }
+
+        // Leaves scientist patrols at the wreck through the ScientistPatrols plugin.
+        private void SpawnDeathPatrols(Vector3 wreck)
+        {
+            if (_config.PatrolsOnDeath <= 0) return;
+
+            if (ScientistPatrols == null || !ScientistPatrols.IsLoaded)
+            {
+                PrintWarning("ScientistPatrols isn't loaded, so no patrols were left at the Bradley wreck.");
+                return;
+            }
+
+            for (int i = 0; i < _config.PatrolsOnDeath; i++)
+            {
+                // Spread the patrols around the wreck so they don't spawn inside it or each other.
+                float angle = i * Mathf.PI * 2f / _config.PatrolsOnDeath;
+                Vector3 spot = wreck + new Vector3(Mathf.Cos(angle), 0f, Mathf.Sin(angle)) * 8f;
+                if (TerrainMeta.HeightMap != null)
+                    spot.y = TerrainMeta.HeightMap.GetHeight(spot);
+
+                object spawned = ScientistPatrols.Call("SpawnPatrolAt", spot, _config.PatrolTierOnDeath);
+                if (!(spawned is bool) || !(bool)spawned)
+                    PrintWarning($"ScientistPatrols could not spawn a '{_config.PatrolTierOnDeath}' patrol at the wreck.");
+            }
+        }
+
+        #endregion
+
+        #region Map markers
+
+        private void UpdateMarkers()
+        {
+            foreach (var pair in _markers.ToList())
+            {
+                if (pair.Key == null || pair.Key.IsDestroyed)
+                {
+                    pair.Value.Destroy();
+                    _markers.Remove(pair.Key);
+                    continue;
+                }
+                pair.Value.MoveTo(pair.Key.transform.position);
+            }
+        }
+
+        private void RemoveMarker(BradleyAPC apc)
+        {
+            MapMarker marker;
+            if (!_markers.TryGetValue(apc, out marker)) return;
+            marker.Destroy();
+            _markers.Remove(apc);
+        }
+
+        // A coloured dot plus a hover label, moved as the Bradley moves.
+        private sealed class MapMarker
+        {
+            private MapMarkerGenericRadius _dot;
+            private VendingMachineMapMarker _label;
+
+            public static MapMarker Create(Vector3 position, string hexColor, string text, float radius)
+            {
+                var marker = new MapMarker();
+                Color color;
+                if (!ColorUtility.TryParseHtmlString(hexColor, out color))
+                    color = Color.magenta;
+
+                marker._dot = GameManager.server.CreateEntity(GenericMarkerPrefab, position, Quaternion.identity) as MapMarkerGenericRadius;
+                if (marker._dot != null)
+                {
+                    marker._dot.EnableSaving(false);
+                    marker._dot.alpha = 0.8f;
+                    marker._dot.color1 = color;
+                    marker._dot.color2 = Color.black;
+                    marker._dot.radius = radius;
+                    marker._dot.Spawn();
+                    marker._dot.SendUpdate();
+                }
+
+                marker._label = GameManager.server.CreateEntity(LabelMarkerPrefab, position, Quaternion.identity) as VendingMachineMapMarker;
+                if (marker._label != null)
+                {
+                    marker._label.EnableSaving(false);
+                    marker._label.markerShopName = text;
+                    marker._label.Spawn();
+                }
+
+                return marker;
+            }
+
+            public void MoveTo(Vector3 position)
+            {
+                if (_dot != null && !_dot.IsDestroyed)
+                {
+                    _dot.transform.position = position;
+                    _dot.SendUpdate();
+                }
+                if (_label != null && !_label.IsDestroyed)
+                {
+                    _label.transform.position = position;
+                    _label.SendNetworkUpdate();
+                }
+            }
+
+            public void Destroy()
+            {
+                if (_dot != null && !_dot.IsDestroyed)
+                    _dot.Kill();
+                if (_label != null && !_label.IsDestroyed)
+                    _label.Kill();
+            }
         }
 
         private void ScheduleDespawn(BradleyAPC apc)

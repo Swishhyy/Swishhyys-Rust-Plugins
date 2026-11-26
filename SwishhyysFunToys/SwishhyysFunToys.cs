@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Newtonsoft.Json;
+using Rust;
 using UnityEngine;
 
 namespace Oxide.Plugins
