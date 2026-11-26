@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SwishhyysFunToys", "Swishhyy", "0.5.0")]
+    [Info("SwishhyysFunToys", "Swishhyy", "0.5.1")]
     [Description("Fun toys: jet airstrikes and barrages, cluster missiles, mass airdrops, meteor showers and lightning storms.")]
     public class SwishhyysFunToys : RustPlugin
     {
@@ -490,6 +490,20 @@ namespace Oxide.Plugins
             return true;
         }
 
+        // True only while one of our signals is going off, so its cargo plane can be removed.
+        private bool suppressCargoPlane;
+
+        private void OnEntitySpawned(CargoPlane plane)
+        {
+            if (!suppressCargoPlane || plane == null)
+                return;
+            NextTick(() =>
+            {
+                if (plane != null && !plane.IsDestroyed)
+                    plane.Kill();
+            });
+        }
+
         private void OnExplosiveThrown(BasePlayer player, BaseEntity entity, ThrownWeapon weapon) => HandleSignal(player, entity, weapon);
 
         private void OnExplosiveDropped(BasePlayer player, BaseEntity entity, ThrownWeapon weapon) => HandleSignal(player, entity, weapon);
@@ -520,9 +534,18 @@ namespace Oxide.Plugins
                 Vector3 at = entity.transform.position;
                 if (signal != null)
                 {
-                    // Turn the smoke on without the cargo plane, then tidy up.
-                    signal.SetFlag(BaseEntity.Flags.On, true);
-                    signal.SendNetworkUpdateImmediate();
+                    // Let the signal go off for its real smoke. The cargo plane it calls is
+                    // removed as soon as it spawns (see OnEntitySpawned below).
+                    suppressCargoPlane = true;
+                    try
+                    {
+                        signal.Explode();
+                    }
+                    finally
+                    {
+                        NextTick(() => suppressCargoPlane = false);
+                    }
+
                     timer.Once(Mathf.Max(1f, config.SignalSmokeSeconds), () =>
                     {
                         if (signal != null && !signal.IsDestroyed)
