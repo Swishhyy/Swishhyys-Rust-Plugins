@@ -8,7 +8,7 @@ using Oxide.Core.Plugins;
 
 namespace Oxide.Plugins
 {
-    [Info("LivePluginInstaller", "Swishhyy", "0.1.0")]
+    [Info("LivePluginInstaller", "Swishhyy", "0.1.1")]
     [Description("Installs and reloads plugins from oxide/plugin-staging on a live server, without a restart")]
     public class LivePluginInstaller : RustPlugin
     {
@@ -24,7 +24,8 @@ namespace Oxide.Plugins
         #region Paths
 
         // Drop .cs files in here (FTP, SFTP, or a git pull on the server).
-        private string StagingDir => Path.Combine(Interface.Oxide.RootDirectory, "plugin-staging");
+        // oxide/plugin-staging, next to oxide/plugins.
+        private string StagingDir => Path.Combine(Path.GetDirectoryName(Interface.Oxide.PluginDirectory.TrimEnd('/', '\\')), "plugin-staging");
         private string PluginsDir => Interface.Oxide.PluginDirectory;
 
         #endregion
@@ -39,6 +40,7 @@ namespace Oxide.Plugins
             try
             {
                 Directory.CreateDirectory(StagingDir);
+                Puts($"Staging folder: {StagingDir}");
             }
             catch (Exception ex)
             {
