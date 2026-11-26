@@ -7,7 +7,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("SwishhyysFunToys", "Swishhyy", "0.4.0")]
+    [Info("SwishhyysFunToys", "Swishhyy", "0.5.0")]
     [Description("Fun toys: jet airstrikes and barrages, cluster missiles, mass airdrops, meteor showers and lightning storms.")]
     public class SwishhyysFunToys : RustPlugin
     {
@@ -198,6 +198,22 @@ namespace Oxide.Plugins
 
             [JsonProperty("Lightning storm: strike effects (empty = find a lightning effect automatically)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
             public List<string> LightningEffects = new List<string>();
+
+            [JsonProperty("Signal items: item shortname (supply.signal or grenade.smoke)")]
+            public string SignalItem = "supply.signal";
+
+            [JsonProperty("Signal items: seconds after throwing before the toy is called in")]
+            public float SignalDelay = 3f;
+
+            [JsonProperty("Signal items: seconds the signal smoke stays")]
+            public float SignalSmokeSeconds = 20f;
+
+            [JsonProperty("Signal items: skin ID per toy (0 = default look)", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, ulong> SignalSkins = new Dictionary<string, ulong>
+            {
+                ["airstrike"] = 0, ["barrage"] = 0, ["cluster"] = 0,
+                ["massdrop"] = 0, ["meteors"] = 0, ["lightningstorm"] = 0
+            };
         }
 
         protected override void LoadDefaultConfig() => config = new Configuration();
@@ -230,6 +246,8 @@ namespace Oxide.Plugins
             config.ClusterSpeed = Mathf.Max(10f, config.ClusterSpeed);
             config.ClusterSplitHeight = Mathf.Clamp(config.ClusterSplitHeight, 10f, ClusterHeight - 20f);
             config.ClusterBomblets = Mathf.Clamp(config.ClusterBomblets, 1, 50);
+            config.SignalDelay = Mathf.Max(0.5f, config.SignalDelay);
+            config.SignalSkins = config.SignalSkins ?? new Dictionary<string, ulong>();
 
             SaveConfig();
         }
@@ -305,111 +323,215 @@ namespace Oxide.Plugins
 
         #region Chat commands
 
-        [ChatCommand("airstrike")]
-        private void CmdAirstrike(BasePlayer player, string command, string[] args)
-        {
-            if (!TryStartUse(player, out Vector3 target))
-            {
-                return;
-            }
+        // Signal items carry "swishhyysfuntoys:<toy>:<count>" in their item text.
+        private const string SignalTag = "swishhyysfuntoys:";
+        private static readonly string[] ToyNames = { "airstrike", "barrage", "cluster", "massdrop", "meteors", "lightningstorm" };
 
-            PrintToChat($"Air support inbound for {player.displayName}. Clear the area!");
-            RunAirstrike(target, player, 0f);
-        }
+        [ChatCommand("airstrike")]
+        private void CmdAirstrike(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "airstrike", args);
 
         [ChatCommand("barrage")]
-        private void CmdBarrage(BasePlayer player, string command, string[] args)
-        {
-            if (!TryParseCount(args, config.BarrageJets, config.BarrageMaxJets, player, out int jets))
-            {
-                return;
-            }
-            if (!TryStartUse(player, out Vector3 target))
-            {
-                return;
-            }
-
-            PrintToChat($"Airstrike barrage inbound for {player.displayName}: {jets} jets. Take cover!");
-            for (int i = 0; i < jets; i++)
-            {
-                // The first bomb hits the aim point; the rest spread around it.
-                Vector3 spot = i == 0 ? target : GroundAt(RandomPointInDisc(target, config.BarrageSpread), target.y);
-                RunAirstrike(spot, player, i * config.BarrageInterval);
-            }
-        }
+        private void CmdBarrage(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "barrage", args);
 
         [ChatCommand("cluster")]
-        private void CmdCluster(BasePlayer player, string command, string[] args)
-        {
-            if (!TryStartUse(player, out Vector3 target))
-            {
-                return;
-            }
-
-            PrintToChat($"Cluster missile inbound for {player.displayName}!");
-            LaunchCluster(target, player);
-        }
+        private void CmdCluster(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "cluster", args);
 
         [ChatCommand("massdrop")]
-        private void CmdMassDrop(BasePlayer player, string command, string[] args)
-        {
-            if (!TryParseCount(args, config.DefaultCrates, config.MaxCrates, player, out int count))
-            {
-                return;
-            }
-            if (!TryStartUse(player, out Vector3 center))
-            {
-                return;
-            }
-
-            PrintToChat($"Mass airdrop: {count} crates incoming!");
-            for (int i = 0; i < count; i++)
-            {
-                Vector3 spot = RandomPointInDisc(center, config.AirdropRadius);
-                timer.Once(i * AirdropSpacing, () => SpawnSupplyDrop(spot));
-            }
-        }
+        private void CmdMassDrop(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "massdrop", args);
 
         [ChatCommand("meteors")]
-        private void CmdMeteors(BasePlayer player, string command, string[] args)
+        private void CmdMeteors(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "meteors", args);
+
+        [ChatCommand("lightningstorm")]
+        private void CmdLightningStorm(BasePlayer player, string command, string[] args) => HandleToyCommand(player, "lightningstorm", args);
+
+        // `/toy [count] [item]`: fires at the aim point, or with "item" gives a signal grenade
+        // that calls the toy in where it's thrown. Getting the item uses the cooldown; throwing doesn't.
+        private void HandleToyCommand(BasePlayer player, string toy, string[] args)
         {
-            if (!TryParseCount(args, config.DefaultMeteors, config.MaxMeteors, player, out int count))
+            bool asItem = args.Any(a => a.Equals("item", StringComparison.OrdinalIgnoreCase));
+            string[] countArgs = args.Where(a => !a.Equals("item", StringComparison.OrdinalIgnoreCase)).ToArray();
+
+            int count = 0;
+            int fallback, max;
+            if (CountLimits(toy, out fallback, out max))
             {
-                return;
+                if (!TryParseCount(countArgs, fallback, max, player, out count))
+                    return;
             }
-            if (!TryStartUse(player, out Vector3 center))
+            else if (countArgs.Length > 0)
             {
+                player.ChatMessage($"/{toy} doesn't take a count. Use /{toy} or /{toy} item.");
                 return;
             }
 
-            PrintToChat("Meteor shower over the area!");
-            for (int i = 0; i < count; i++)
+            if (!CanUse(player))
+                return;
+
+            if (asItem)
             {
-                Vector3 spot = RandomPointInDisc(center, config.MeteorRadius);
-                float delay = UnityEngine.Random.Range(0f, config.MeteorWindow);
-                timer.Once(delay, () => LaunchMeteor(spot, player));
+                if (GiveSignal(player, toy, count))
+                    MarkUsed(player);
+                return;
+            }
+
+            Vector3 target;
+            if (!TryAim(player, out target))
+                return;
+
+            MarkUsed(player);
+            RunToy(toy, target, player, count);
+        }
+
+        private bool CountLimits(string toy, out int fallback, out int max)
+        {
+            switch (toy)
+            {
+                case "barrage": fallback = config.BarrageJets; max = config.BarrageMaxJets; return true;
+                case "massdrop": fallback = config.DefaultCrates; max = config.MaxCrates; return true;
+                case "meteors": fallback = config.DefaultMeteors; max = config.MaxMeteors; return true;
+                case "lightningstorm": fallback = config.DefaultStrikes; max = config.MaxStrikes; return true;
+                default: fallback = 0; max = 0; return false;
             }
         }
 
-        [ChatCommand("lightningstorm")]
-        private void CmdLightningStorm(BasePlayer player, string command, string[] args)
+        // Fires a toy at `target`. Used by the chat commands and by thrown signal items.
+        private void RunToy(string toy, Vector3 target, BasePlayer caller, int count)
         {
-            if (!TryParseCount(args, config.DefaultStrikes, config.MaxStrikes, player, out int count))
+            string who = caller != null ? caller.displayName : "someone";
+            switch (toy)
             {
-                return;
+                case "airstrike":
+                    PrintToChat($"Air support inbound for {who}. Clear the area!");
+                    RunAirstrike(target, caller, 0f);
+                    break;
+
+                case "barrage":
+                    PrintToChat($"Airstrike barrage inbound for {who}: {count} jets. Take cover!");
+                    for (int i = 0; i < count; i++)
+                    {
+                        // The first bomb hits the target; the rest spread around it.
+                        Vector3 spot = i == 0 ? target : GroundAt(RandomPointInDisc(target, config.BarrageSpread), target.y);
+                        RunAirstrike(spot, caller, i * config.BarrageInterval);
+                    }
+                    break;
+
+                case "cluster":
+                    PrintToChat($"Cluster missile inbound for {who}!");
+                    LaunchCluster(target, caller);
+                    break;
+
+                case "massdrop":
+                    PrintToChat($"Mass airdrop: {count} crates incoming!");
+                    for (int i = 0; i < count; i++)
+                    {
+                        Vector3 spot = RandomPointInDisc(target, config.AirdropRadius);
+                        timer.Once(Mathf.Max(0.01f, i * AirdropSpacing), () => SpawnSupplyDrop(spot));
+                    }
+                    break;
+
+                case "meteors":
+                    PrintToChat("Meteor shower over the area!");
+                    for (int i = 0; i < count; i++)
+                    {
+                        Vector3 spot = RandomPointInDisc(target, config.MeteorRadius);
+                        timer.Once(UnityEngine.Random.Range(0.01f, config.MeteorWindow), () => LaunchMeteor(spot, caller));
+                    }
+                    break;
+
+                case "lightningstorm":
+                    PrintToChat("Lightning storm rolling in!");
+                    for (int i = 0; i < count; i++)
+                    {
+                        Vector3 spot = RandomPointInDisc(target, config.LightningRadius);
+                        timer.Once(UnityEngine.Random.Range(0.01f, config.LightningWindow), () => Detonate(spot, 2f, config.LightningDamage, caller, lightningFx));
+                    }
+                    break;
             }
-            if (!TryStartUse(player, out Vector3 center))
+        }
+
+        #endregion
+
+        #region Signal items
+
+        private static string SignalLabel(string toy, int count)
+        {
+            switch (toy)
             {
-                return;
+                case "airstrike": return "Airstrike Signal";
+                case "barrage": return $"Airstrike Barrage Signal ({count} jets)";
+                case "cluster": return "Cluster Missile Signal";
+                case "massdrop": return $"Mass Airdrop Signal ({count})";
+                case "meteors": return $"Meteor Shower Signal ({count})";
+                case "lightningstorm": return $"Lightning Storm Signal ({count})";
+                default: return "Fun Toy Signal";
+            }
+        }
+
+        private bool GiveSignal(BasePlayer player, string toy, int count)
+        {
+            ulong skin = 0;
+            if (config.SignalSkins != null)
+                config.SignalSkins.TryGetValue(toy, out skin);
+
+            Item item = ItemManager.CreateByName(config.SignalItem, 1, skin);
+            if (item == null)
+            {
+                PrintWarning($"Signal item '{config.SignalItem}' doesn't exist on this server.");
+                player.ChatMessage("Signal items aren't available right now.");
+                return false;
             }
 
-            PrintToChat("Lightning storm rolling in!");
-            for (int i = 0; i < count; i++)
+            item.name = SignalLabel(toy, count);
+            item.text = SignalTag + toy + ":" + count;
+            item.MarkDirty();
+            player.GiveItem(item);
+            player.ChatMessage($"You got a {item.name}. Throw it where you want it.");
+            return true;
+        }
+
+        private void OnExplosiveThrown(BasePlayer player, BaseEntity entity, ThrownWeapon weapon) => HandleSignal(player, entity, weapon);
+
+        private void OnExplosiveDropped(BasePlayer player, BaseEntity entity, ThrownWeapon weapon) => HandleSignal(player, entity, weapon);
+
+        // A thrown signal item: stop the supply signal calling a cargo plane, then after a short
+        // delay show its smoke and call the toy in where it landed.
+        private void HandleSignal(BasePlayer player, BaseEntity entity, ThrownWeapon weapon)
+        {
+            Item item = weapon?.GetItem();
+            if (entity == null || item == null || string.IsNullOrEmpty(item.text) || !item.text.StartsWith(SignalTag))
+                return;
+
+            string[] parts = item.text.Substring(SignalTag.Length).Split(':');
+            string toy = parts[0];
+            int count = 0;
+            if (!ToyNames.Contains(toy) || (parts.Length > 1 && !int.TryParse(parts[1], out count)))
+                return;
+
+            var signal = entity as SupplySignal;
+            if (signal != null)
+                signal.CancelInvoke(signal.Explode);
+
+            timer.Once(config.SignalDelay, () =>
             {
-                Vector3 spot = RandomPointInDisc(center, config.LightningRadius);
-                float delay = UnityEngine.Random.Range(0f, config.LightningWindow);
-                timer.Once(delay, () => Detonate(spot, 2f, config.LightningDamage, player, lightningFx));
-            }
+                if (entity == null || entity.IsDestroyed)
+                    return;
+
+                Vector3 at = entity.transform.position;
+                if (signal != null)
+                {
+                    // Turn the smoke on without the cargo plane, then tidy up.
+                    signal.SetFlag(BaseEntity.Flags.On, true);
+                    signal.SendNetworkUpdateImmediate();
+                    timer.Once(Mathf.Max(1f, config.SignalSmokeSeconds), () =>
+                    {
+                        if (signal != null && !signal.IsDestroyed)
+                            signal.Kill();
+                    });
+                }
+
+                RunToy(toy, at, player, count);
+            });
         }
 
         #endregion
@@ -656,12 +778,9 @@ namespace Oxide.Plugins
 
         #region Helpers
 
-        /// Checks permission and cooldown, then aims where the player is looking.
-        /// The cooldown only starts once a toy really fires.
-        private bool TryStartUse(BasePlayer player, out Vector3 target)
+        // Permission and cooldown. Admins (swishhyysfuntoys.admin) skip the cooldown.
+        private bool CanUse(BasePlayer player)
         {
-            target = Vector3.zero;
-
             if (!permission.UserHasPermission(player.UserIDString, PermUse))
             {
                 player.ChatMessage("You don't have permission to use fun toys.");
@@ -678,7 +797,15 @@ namespace Oxide.Plugins
                     return false;
                 }
             }
+            return true;
+        }
 
+        private void MarkUsed(BasePlayer player) => lastUsed[player.userID] = Time.realtimeSinceStartup;
+
+        // Where the player is looking, within range.
+        private bool TryAim(BasePlayer player, out Vector3 target)
+        {
+            target = Vector3.zero;
             if (!Physics.Raycast(player.eyes.HeadRay(), out RaycastHit hit, config.MaxRange, LayerMask.GetMask("Terrain", "World", "Default")))
             {
                 player.ChatMessage("Aim at the ground within range first.");
@@ -686,7 +813,6 @@ namespace Oxide.Plugins
             }
 
             target = hit.point;
-            lastUsed[player.userID] = Time.realtimeSinceStartup;
             return true;
         }
 
